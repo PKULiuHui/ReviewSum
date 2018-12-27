@@ -15,6 +15,7 @@
 
 # In[49]:
 
+import io
 import pandas as pd
 import numpy as np
 import tensorflow as tf
@@ -30,7 +31,7 @@ print('TensorFlow Version: {}'.format(tf.__version__))
 
 # In[2]:
 
-reviews = pd.read_csv("Reviews.csv")
+reviews = pd.read_csv("../data/Reviews.csv")
 
 # In[3]:
 
@@ -237,7 +238,7 @@ print("Size of Vocabulary:", len(word_counts))
 # Load Conceptnet Numberbatch's (CN) embeddings, similar to GloVe, but probably better 
 # (https://github.com/commonsense/conceptnet-numberbatch)
 embeddings_index = {}
-with open('/Users/Dave/Desktop/Programming/numberbatch-en-17.02.txt', encoding='utf-8') as f:
+with io.open('../embedding/numberbatch-en-17.06.txt', encoding='utf-8') as f:
     for line in f:
         values = line.split(' ')
         word = values[0]
