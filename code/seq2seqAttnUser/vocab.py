@@ -23,6 +23,9 @@ class Vocab:
         self.id2word = {v: k for k, v in self.word2id.items()}
         self.word2cnt = {self.PAD_TOKEN: 10000, self.SOS_TOKEN: 10000, self.EOS_TOKEN: 10000,
                          self.UNK_TOKEN: 10000}  # 给这几个标记较大的值防止后面被删去
+        self.user_num = 0
+        self.user2id = {}
+        self.id2user = {}
         for i in range(4):
             self.embed.append(np.random.normal(size=args.embed_dim))
         if embed is not None:
@@ -45,6 +48,13 @@ class Vocab:
                 self.next_idx += 1
             else:
                 self.word2cnt[w] += 1
+
+    # 读取一个用户，更新用户列表
+    def add_user(self, user):
+        if user not in self.user2id:
+            self.user2id[user] = self.user_num
+            self.id2user[self.user_num] = user
+            self.user_num += 1
 
     # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量
     def trim(self):
@@ -114,8 +124,14 @@ class Vocab:
             cur_idx.extend([self.PAD_IDX] * (trg_max_len - len(summary)))
             trg.append(cur_idx)
             trg_lens.append(len(summary))
-        src, trg, src_mask = torch.LongTensor(src), torch.LongTensor(trg), torch.LongTensor(src_mask)
-        if self.args.use_cuda:
-            src, trg, src_mask = src.cuda(), trg.cuda(), src_mask.cuda()
 
-        return src, trg, src_mask, src_lens, trg_lens, src_text, trg_text
+        src_user = []
+        for user in batch['userID']:
+            src_user.append(self.user2id[user])
+
+        src, trg, src_mask, src_user = torch.LongTensor(src), torch.LongTensor(trg), torch.LongTensor(src_mask), \
+                                       torch.LongTensor(src_user)
+        if self.args.use_cuda:
+            src, trg, src_mask, src_user = src.cuda(), trg.cuda(), src_mask.cuda(), src_user.cuda()
+
+        return src, trg, src_mask, src_lens, trg_lens, src_user, src_text, trg_text

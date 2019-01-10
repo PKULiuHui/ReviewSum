@@ -6,11 +6,9 @@
 import os
 from Rouge155 import Rouge155
 import sys
+from tqdm import tqdm
 import random
-
-reload(sys)
-sys.setdefaultencoding('utf-8')
-
+from sumeval.metrics.rouge import RougeCalculator
 
 def get_rouge_score(hyp, ref):
     score = {}
@@ -53,5 +51,30 @@ def get_rouge_score(hyp, ref):
 
 
 if __name__ == '__main__':
-    s = get_rouge_score('I went to the Mars from my living town.', 'I went to Mars')
+    """
+    hyp = "I'm living New York its my home town so awesome"
+    ref = "My home town is awesome"
+    print('Standard Rouge:')
+    s = get_rouge_score(hyp, ref)
     print(s)
+    """
+    f = open('../seq2seqAttn/output/valid_50_7.6022_0.1191_0.0279_0.1167', 'r')
+    content = f.readlines()
+    r1, r2, rl = .0, .0, .0
+    cnt = 0
+    ref = ''
+    hyp = ''
+    for line in tqdm(content):
+        if len(line) < 5:
+            continue
+        if line[0] == '=':
+            ref = line[1:].strip()
+        if line[0] == '<':
+            hyp = line[1:].strip()
+            cnt += 1
+            s = get_rouge_score(hyp, ref)
+            r1 += s['ROUGE-1']['f']
+            r2 += s['ROUGE-2']['f']
+            rl += s['ROUGE-L']['f']
+    print(r1, r2, rl)
+    f.close()

@@ -9,44 +9,49 @@ class EncoderDecoder(nn.Module):
 
     def __init__(self, args, embed):
         super(EncoderDecoder, self).__init__()
-        self.name = 'seq2seqAttn'
+        self.name = 'seq2seqAttnUser'
         self.args = args
         # Embedding layer
         self.embed = nn.Embedding(args.embed_num, args.embed_dim)
         if embed is not None:
             self.embed.weight.data.copy_(embed)
+        # User embedding
+        self.user_embed = nn.Embedding(args.user_num, args.user_dim)
         # Encoder
         self.encoder_rnn = nn.GRU(args.embed_dim, args.hidden_size, args.num_layers,
                                   batch_first=True, bidirectional=True, dropout=args.encoder_dropout)
         # Attention
-        self.attention = BahdanauAttention(args.hidden_size)
+        self.attention = BahdanauAttention(args.hidden_size, query_size=args.hidden_size + args.user_dim)
         # Decoder
-        self.decoder_rnn = nn.GRU(args.embed_dim + 2 * args.hidden_size, args.hidden_size, args.num_layers,
+        self.decoder_rnn = nn.GRU(args.embed_dim + 2 * args.hidden_size + args.user_dim, args.hidden_size, args.num_layers,
                                   batch_first=True, dropout=args.decoder_dropout)
         self.init_hidden = nn.Linear(2 * args.hidden_size, args.hidden_size)
         self.dropout_layer = nn.Dropout(p=args.decoder_dropout)
-        self.pre_output_layer = nn.Linear(args.hidden_size + 2 * args.hidden_size + args.embed_dim, args.hidden_size)
+        self.pre_output_layer = nn.Linear(args.hidden_size + 2 * args.hidden_size + args.embed_dim + args.user_dim, args.hidden_size)
         # Generator
         self.generator = nn.Linear(args.hidden_size, args.embed_num)
 
-    def decode_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden):
+    def decode_step(self, prev_embed, user_embed, encoder_hidden, src_mask, proj_key, hidden):
         """Perform a single decoder step (1 word)"""
 
         # compute context vector using attention mechanism
-        query = hidden[-1].unsqueeze(1)  # [B, 1, H]
+        query = torch.cat([hidden[-1].unsqueeze(1), user_embed], dim=2)  # [B, 1, H]
         context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
 
         # update rnn hidden state
-        rnn_input = torch.cat([prev_embed, context], dim=2)
+        rnn_input = torch.cat([prev_embed, user_embed, context], dim=2)
         output, hidden = self.decoder_rnn(rnn_input, hidden)
 
-        pre_output = torch.cat([prev_embed, output, context], dim=2)
+        pre_output = torch.cat([prev_embed, user_embed, output, context], dim=2)
         pre_output = self.dropout_layer(pre_output)
         pre_output = self.pre_output_layer(pre_output)
 
         return output, hidden, pre_output
 
-    def forward(self, src, trg, src_mask, src_lengths, trg_lengths, test=False):
+    def forward(self, src, trg, src_mask, src_lengths, trg_lengths, src_user, test=False):
+        # embed user
+        user_embed = self.user_embed(src_user).unsqueeze(1)
+
         # embed input
         src_embed = self.embed(src)  # x: [B, S, D]
 
@@ -79,7 +84,7 @@ class EncoderDecoder(nn.Module):
                 else:  # last predicted word embedding
                     prev_idx = torch.argmax(pre_output_vectors[-1], dim=-1)
                     prev_embed = self.embed(prev_idx)
-            output, hidden, pre_output = self.decode_step(prev_embed, encoder_hidden, src_mask, proj_key, hidden)
+            output, hidden, pre_output = self.decode_step(prev_embed, user_embed, encoder_hidden, src_mask, proj_key, hidden)
             pre_output_vectors.append(F.log_softmax(self.generator(pre_output), dim=-1))
 
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)

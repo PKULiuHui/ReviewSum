@@ -1,6 +1,6 @@
 # coding: utf-8
 
-# Use seq2seq + Bahdanau attention to generate amazon review summaries.
+# Use seq2seq to generate amazon review summaries.
 # Ref: https://bastings.github.io/annotated_encoder_decoder/
 
 import os
@@ -18,9 +18,9 @@ from dataset import Dataset
 from models import EncoderDecoder
 from sumeval.metrics.rouge import RougeCalculator
 
-parser = argparse.ArgumentParser(description='seq2seqAttn')
+parser = argparse.ArgumentParser(description='seq2seq')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints2/')
+parser.add_argument('-save_path', type=str, default='checkpoints8/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.6B.300d.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/user_based/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/user_based/valid/')
@@ -39,9 +39,10 @@ parser.add_argument('-encoder_dropout', type=float, default=0.1)
 parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay', type=float, default=0.5)
+parser.add_argument('-teacher', type=float, default=1.0)
 parser.add_argument('-max_norm', type=float, default=5.0)
 parser.add_argument('-batch_size', type=int, default=32)
-parser.add_argument('-epochs', type=int, default=10)
+parser.add_argument('-epochs', type=int, default=8)
 parser.add_argument('-seed', type=int, default=2333)
 parser.add_argument('-valid_every', type=int, default=1000)
 parser.add_argument('-test', action='store_true')
@@ -120,9 +121,13 @@ def train():
     with open(args.embed_path, 'r') as f:
         f.readline()
         for line in f.readlines():
-            line = line.strip().split()
-            vec = [float(_) for _ in line[1:]]
-            embed[line[0]] = vec
+            line1 = line.strip().split()
+            try:
+                vec = [float(_) for _ in line1[1:]]
+            except:
+                print('mark')
+                continue
+            embed[line1[0]] = vec
     vocab = Vocab(args, embed)
 
     print('Loading datasets...')
@@ -191,6 +196,10 @@ def train():
                 net.save(save_path)
                 print('Epoch: %2d Cur_Val_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' %
                       (epoch, cur_loss, r1, r2, rl))
+        """
+        if epoch >= 4:
+            adjust_learning_rate(optim, epoch - 3)
+        """
     return
 
 
@@ -233,7 +242,7 @@ def test():
     embed = vocab.trim()
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
-    test_dataset = Dataset(val_data)
+    test_dataset = Dataset(test_data)
     test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
 
     print('Loading model...')

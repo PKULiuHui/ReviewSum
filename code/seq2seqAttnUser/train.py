@@ -1,6 +1,6 @@
 # coding: utf-8
 
-# Use seq2seq + Bahdanau attention to generate amazon review summaries.
+# Use seq2seq + Bahdanau attention to generate amazon review summaries, considering user information.
 # Ref: https://bastings.github.io/annotated_encoder_decoder/
 
 import os
@@ -18,9 +18,9 @@ from dataset import Dataset
 from models import EncoderDecoder
 from sumeval.metrics.rouge import RougeCalculator
 
-parser = argparse.ArgumentParser(description='seq2seqAttn')
+parser = argparse.ArgumentParser(description='seq2seqAttnUser')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints2/')
+parser.add_argument('-save_path', type=str, default='checkpoints1/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.6B.300d.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/user_based/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/user_based/valid/')
@@ -31,7 +31,9 @@ parser.add_argument('-example_num', type=int, default=4)
 # hyper paras
 parser.add_argument('-embed_dim', type=int, default=300)
 parser.add_argument('-embed_num', type=int, default=0)
-parser.add_argument('-word_min_cnt', type=int, default=10)
+parser.add_argument('-user_dim', type=int, default=300)
+parser.add_argument('-user_num', type=int, default=0)
+parser.add_argument('-word_min_cnt', type=int, default=20)
 parser.add_argument('-sum_max_len', type=int, default=15)
 parser.add_argument('-hidden_size', type=int, default=512)
 parser.add_argument('-num_layers', type=int, default=2)
@@ -72,8 +74,8 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
     loss, r1, r2, rl = .0, .0, .0, .0
     rouge = RougeCalculator(stopwords=False, lang="en")
     for batch in tqdm(data_iter):
-        src, trg, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.make_tensors(batch)
-        pre = net(src, trg, src_mask, src_lens, trg_lens, test=True)
+        src, trg, src_mask, src_lens, trg_lens, src_user, src_text, trg_text = vocab.make_tensors(batch)
+        pre = net(src, trg, src_mask, src_lens, trg_lens, src_user, test=True)
         pre_output = pre.view(-1, pre.size(-1))
         trg_output = trg.view(-1)
         loss += criterion(pre_output, trg_output).data.item() / len(src_lens)
@@ -135,6 +137,7 @@ def train():
         f.close()
         vocab.add_sentence(train_data[-1]['reviewText'].split())
         vocab.add_sentence(train_data[-1]['summary'].split())
+        vocab.add_user(train_data[-1]['userID'])
     fns = os.listdir(args.valid_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -143,6 +146,7 @@ def train():
         f.close()
         vocab.add_sentence(val_data[-1]['reviewText'].split())
         vocab.add_sentence(val_data[-1]['summary'].split())
+        vocab.add_user(val_data[-1]['userID'])
     fns = os.listdir(args.test_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -151,11 +155,13 @@ def train():
         f.close()
         vocab.add_sentence(test_data[-1]['reviewText'].split())
         vocab.add_sentence(test_data[-1]['summary'].split())
+        vocab.add_user(test_data[-1]['userID'])
 
     print('Deleting rare words...')
     embed = vocab.trim()
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
+    args.user_num = len(vocab.user2id)
 
     train_dataset = Dataset(train_data)
     val_dataset = Dataset(val_data)
@@ -171,8 +177,8 @@ def train():
     print('Begin training...')
     for epoch in range(1, args.epochs + 1):
         for i, batch in enumerate(train_iter):
-            src, trg, src_mask, src_lens, trg_lens, _1, _2 = vocab.make_tensors(batch)
-            pre_output = net(src, trg, src_mask, src_lens, trg_lens)
+            src, trg, src_mask, src_lens, trg_lens, src_user, _1, _2 = vocab.make_tensors(batch)
+            pre_output = net(src, trg, src_mask, src_lens, trg_lens, src_user)
             pre_output = pre_output.view(-1, pre_output.size(-1))
             trg_output = trg.view(-1)
             loss = criterion(pre_output, trg_output) / len(src_lens)
@@ -214,6 +220,7 @@ def test():
         f.close()
         vocab.add_sentence(train_data[-1]['reviewText'].split())
         vocab.add_sentence(train_data[-1]['summary'].split())
+        vocab.add_user(train_data[-1]['userID'])
     fns = os.listdir(args.valid_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -222,6 +229,7 @@ def test():
         f.close()
         vocab.add_sentence(val_data[-1]['reviewText'].split())
         vocab.add_sentence(val_data[-1]['summary'].split())
+        vocab.add_user(val_data[-1]['userID'])
     fns = os.listdir(args.test_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -230,10 +238,12 @@ def test():
         f.close()
         vocab.add_sentence(test_data[-1]['reviewText'].split())
         vocab.add_sentence(test_data[-1]['summary'].split())
+        vocab.add_user(test_data[-1]['userID'])
     embed = vocab.trim()
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
-    test_dataset = Dataset(val_data)
+    args.user_num = len(vocab.user2id)
+    test_dataset = Dataset(test_data)
     test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
 
     print('Loading model...')
