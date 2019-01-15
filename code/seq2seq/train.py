@@ -20,8 +20,8 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='seq2seq')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints8/')
-parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.6B.300d.txt')
+parser.add_argument('-save_path', type=str, default='checkpoints5/')
+parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.review.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/user_based/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/user_based/valid/')
 parser.add_argument('-test_dir', type=str, default='../../data/user_based/test/')
@@ -31,7 +31,7 @@ parser.add_argument('-example_num', type=int, default=4)
 # hyper paras
 parser.add_argument('-embed_dim', type=int, default=300)
 parser.add_argument('-embed_num', type=int, default=0)
-parser.add_argument('-word_min_cnt', type=int, default=10)
+parser.add_argument('-word_min_cnt', type=int, default=20)
 parser.add_argument('-sum_max_len', type=int, default=15)
 parser.add_argument('-hidden_size', type=int, default=512)
 parser.add_argument('-num_layers', type=int, default=2)
