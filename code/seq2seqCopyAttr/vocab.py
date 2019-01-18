@@ -26,6 +26,12 @@ class Vocab:
         self.id2word = {v: k for k, v in self.word2id.items()}
         self.word2cnt = {self.PAD_TOKEN: 10000, self.SOS_TOKEN: 10000, self.EOS_TOKEN: 10000,
                          self.UNK_TOKEN: 10000}  # 给这几个标记较大的值防止后面被删去
+        self.user_num = 1
+        self.user2id = {'<UNK-USER>': 0}
+        self.id2user = {0: '<UNK-USER>'}
+        self.product_num = 1
+        self.product2id = {'<UNK-PRODUCT>': 0}
+        self.id2product = {0: '<UNK-PRODUCT>'}
         for i in range(4):
             self.embed.append(np.random.normal(size=args.embed_dim))
         if embed is not None:
@@ -50,6 +56,20 @@ class Vocab:
             else:
                 self.word2cnt[w] += 1
         self.fixed_num = self.word_num
+
+    # 读取一个用户，更新用户列表
+    def add_user(self, user):
+        if user not in self.user2id:
+            self.user2id[user] = self.user_num
+            self.id2user[self.user_num] = user
+            self.user_num += 1
+
+    # 读取一个产品，更新产品列表
+    def add_product(self, product):
+        if product not in self.product2id:
+            self.product2id[product] = self.product_num
+            self.id2product[self.product_num] = product
+            self.product_num += 1
 
     # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量
     def trim(self):
@@ -146,10 +166,25 @@ class Vocab:
             trg.append(cur_idx)
             trg_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
             trg_lens.append(len(summary))
+
+        src_user, src_product = [], []
+        for user in batch['userID']:
+            if user in self.user2id:
+                src_user.append(self.user2id[user])
+            else:
+                src_user.append(0)
+        for product in batch['productID']:
+            if product in self.product2id:
+                src_product.append(self.product2id[product])
+            else:
+                src_product.append(0)
+
         src, trg, src_mask = torch.LongTensor(src), torch.LongTensor(trg), torch.LongTensor(src_mask)
         src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)
+        src_user, src_product = torch.LongTensor(src_user), torch.LongTensor(src_product)
         if self.args.use_cuda:
             src, trg, src_mask = src.cuda(), trg.cuda(), src_mask.cuda()
             src_embed, trg_embed = src_embed.cuda(), trg_embed.cuda()
+            src_user, src_product = src_user.cuda(), src_product.cuda()
 
-        return src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text
+        return src, trg, src_embed, trg_embed, src_user, src_product, src_mask, src_lens, trg_lens, src_text, trg_text

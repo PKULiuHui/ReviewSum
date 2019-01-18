@@ -22,9 +22,9 @@ parser = argparse.ArgumentParser(description='seq2seqAttnCopy')
 # path info
 parser.add_argument('-save_path', type=str, default='checkpoints1/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.review.txt')
-parser.add_argument('-train_dir', type=str, default='../../data/user_based/train/')
-parser.add_argument('-valid_dir', type=str, default='../../data/user_based/valid/')
-parser.add_argument('-test_dir', type=str, default='../../data/user_based/test/')
+parser.add_argument('-train_dir', type=str, default='../../data/unaligned/train/')
+parser.add_argument('-valid_dir', type=str, default='../../data/unaligned/valid/')
+parser.add_argument('-test_dir', type=str, default='../../data/unaligned/test/')
 parser.add_argument('-load_model', type=str, default='')
 parser.add_argument('-output_dir', type=str, default='output/')
 parser.add_argument('-example_num', type=int, default=4)
@@ -115,16 +115,17 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
 
 
 def train():
-    print('Loading pretrained word embedding...')
-    embed = {}
-    with open(args.embed_path, 'r') as f:
-        f.readline()
-        for line in f.readlines():
-            line = line.strip().split()
-            vec = [float(_) for _ in line[1:]]
-            embed[line[0]] = vec
+    embed = None
+    if args.embed_path is not None and os.path.exists(args.embed_path):
+        print('Loading pretrained word embedding...')
+        embed = {}
+        with open(args.embed_path, 'r') as f:
+            f.readline()
+            for line in f.readlines():
+                line = line.strip().split()
+                vec = [float(_) for _ in line[1:]]
+                embed[line[0]] = vec
     vocab = Vocab(args, embed)
-
     print('Loading datasets...')
     train_data, val_data, test_data = [], [], []
     fns = os.listdir(args.train_dir)
@@ -196,14 +197,16 @@ def train():
 
 
 def test():
-    print('Loading vocab and test dataset...')
-    embed = {}
-    with open(args.embed_path, 'r') as f:
-        f.readline()
-        for line in f.readlines():
-            line = line.strip().split()
-            vec = [float(_) for _ in line[1:]]
-            embed[line[0]] = vec
+    embed = None
+    if args.embed_path is not None and os.path.exists(args.embed_path):
+        print('Loading pretrained word embedding...')
+        embed = {}
+        with open(args.embed_path, 'r') as f:
+            f.readline()
+            for line in f.readlines():
+                line = line.strip().split()
+                vec = [float(_) for _ in line[1:]]
+                embed[line[0]] = vec
     vocab = Vocab(args, embed)
 
     train_data, val_data, test_data = [], [], []
