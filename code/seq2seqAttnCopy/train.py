@@ -18,10 +18,11 @@ from dataset import Dataset
 from models import EncoderDecoder, myNLLLoss
 from sumeval.metrics.rouge import RougeCalculator
 
+
 parser = argparse.ArgumentParser(description='seq2seqAttnCopy')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints1/')
-parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.review.txt')
+parser.add_argument('-save_path', type=str, default='checkpoints4/')
+parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.unaligned.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/unaligned/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/unaligned/valid/')
 parser.add_argument('-test_dir', type=str, default='../../data/unaligned/test/')
@@ -40,9 +41,11 @@ parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay', type=float, default=0.5)
 parser.add_argument('-max_norm', type=float, default=5.0)
-parser.add_argument('-batch_size', type=int, default=32)
+parser.add_argument('-batch_size', type=int, default=64)
 parser.add_argument('-epochs', type=int, default=10)
+parser.add_argument('-beam_size', type=int, default=1)
 parser.add_argument('-seed', type=int, default=2333)
+parser.add_argument('-print_every', type=int, default=10)
 parser.add_argument('-valid_every', type=int, default=1000)
 parser.add_argument('-test', action='store_true')
 parser.add_argument('-use_cuda', type=bool, default=False)
@@ -71,30 +74,32 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
     sums = []
     loss, r1, r2, rl = .0, .0, .0, .0
     rouge = RougeCalculator(stopwords=False, lang="en")
-    for batch in tqdm(data_iter):
-        src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.read_batch(batch)
-        pre_output = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens, test=True)
-        output = torch.log(pre_output.view(-1, pre_output.size(-1)) + 1e-20)
-        trg_output = trg.view(-1)
-        loss += criterion(output, trg_output).data.item() / len(src_lens)
-        reviews.extend(src_text)
-        refs.extend(trg_text)
-        pre_output[:, :, 3] = float('-inf')
-        rst = torch.argmax(pre_output, dim=-1).tolist()
-        for i, summary in enumerate(rst):
-            cur_sum = ['']
-            for idx in summary:
-                if idx == vocab.EOS_IDX:
-                    break
-                w = vocab.id_word(idx)
-                cur_sum.append(w)
-            cur_sum = ' '.join(cur_sum).strip()
-            if len(cur_sum) == 0:
-                cur_sum = '<EMP>'
-            sums.append(cur_sum)
-            r1 += rouge.rouge_n(cur_sum, trg_text[i], n=1)
-            r2 += rouge.rouge_n(cur_sum, trg_text[i], n=2)
-            rl += rouge.rouge_l(cur_sum, trg_text[i])
+    with torch.no_grad():
+        for batch in tqdm(data_iter):
+            src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.read_batch(batch)
+            pre_output1 = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens)
+            pre_output = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens, test=True)
+            output = torch.log(pre_output1.view(-1, pre_output1.size(-1)) + 1e-20)
+            trg_output = trg.view(-1)
+            loss += criterion(output, trg_output).data.item() / len(src_lens)
+            reviews.extend(src_text)
+            refs.extend(trg_text)
+            # pre_output[:, :, 3] = float('-inf')
+            rst = torch.argmax(pre_output, dim=-1).tolist()
+            for i, summary in enumerate(rst):
+                cur_sum = ['']
+                for idx in summary:
+                    if idx == vocab.EOS_IDX:
+                        break
+                    w = vocab.id_word(idx)
+                    cur_sum.append(w)
+                cur_sum = ' '.join(cur_sum).strip()
+                if len(cur_sum) == 0:
+                    cur_sum = '<EMP>'
+                sums.append(cur_sum)
+                r1 += rouge.rouge_n(cur_sum, trg_text[i], n=1)
+                r2 += rouge.rouge_n(cur_sum, trg_text[i], n=2)
+                rl += rouge.rouge_l(cur_sum, trg_text[i])
     for i in example_idx:
         print('> %s' % reviews[i])
         print('= %s' % refs[i])
@@ -109,6 +114,57 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
     r1 /= len(sums)
     r2 /= len(sums)
     rl /= len(sums)
+    if train_next:
+        net.train()
+    return loss, r1, r2, rl
+
+
+def evaluate1(net, criterion, vocab, data_iter, train_next=True):
+    net.eval()
+    reviews = []
+    refs = []
+    sums = [[] for _ in range(args.beam_size)]
+    loss, r1, r2, rl = .0, .0, .0, .0
+    rouge = RougeCalculator(stopwords=False, lang="en")
+    for batch in tqdm(data_iter):
+        src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.read_batch(batch)
+        # outputs: batch_size * Beam()
+        outputs = net.beam_search(src, src_embed, vocab.word_num, src_mask, src_lens)
+        reviews.extend(src_text)
+        refs.extend(trg_text)
+        for i, beam in enumerate(outputs):
+            for j in range(args.beam_size):
+                summary = beam.seqs[j]
+                cur_sum = ['']
+                for idx in summary:
+                    idx = int(idx)
+                    if idx == vocab.EOS_IDX:
+                        break
+                    w = vocab.id_word(idx)
+                    cur_sum.append(w)
+                cur_sum = ' '.join(cur_sum).strip()
+                if len(cur_sum) == 0:
+                    cur_sum = '<EMP>'
+                sums[j].append(cur_sum)
+            r1 += rouge.rouge_n(sums[0][-1], trg_text[i], n=1)
+            r2 += rouge.rouge_n(sums[0][-1], trg_text[i], n=2)
+            rl += rouge.rouge_l(sums[0][-1], trg_text[i])
+    for i in example_idx:
+        print('> %s' % reviews[i])
+        print('= %s' % refs[i])
+        for j in range(args.beam_size):
+            print('< %s\n' % sums[j][i])
+    if not train_next:  # 测试阶段将结果写入文件
+        with open(args.output_dir + args.load_model, 'w') as f:
+            for i in range(len(reviews)):
+                f.write('> %s\n' % reviews[i])
+                f.write('= %s\n' % refs[i])
+                for j in range(args.beam_size):
+                    f.write('< %s\n' % sums[j][i])
+                f.write('\n')
+    r1 /= len(sums[0])
+    r2 /= len(sums[0])
+    rl /= len(sums[0])
     if train_next:
         net.train()
     return loss, r1, r2, rl
@@ -155,6 +211,8 @@ def train():
 
     print('Deleting rare words...')
     embed = vocab.trim()
+    # save_embed(vocab, '../../embedding/glove/glove.unaligned.txt')
+
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
 
@@ -181,10 +239,12 @@ def train():
             clip_grad_norm_(net.parameters(), args.max_norm)
             optim.step()
             optim.zero_grad()
-            print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f' % (epoch, args.epochs, i, len(train_iter), loss.data))
 
             cnt = (epoch - 1) * len(train_iter) + i
-            if cnt % args.valid_every == 0 and cnt / args.valid_every >= 0:
+            if cnt % args.print_every == 0:
+                print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f' % (epoch, args.epochs, i, len(train_iter), loss.data))
+
+            if cnt % args.valid_every == 0:
                 print('Begin valid... Epoch %d, Batch %d' % (epoch, i))
                 cur_loss, r1, r2, rl = evaluate(net, criterion, vocab, val_iter, True)
                 save_path = args.save_path + 'valid_%d_%.4f_%.4f_%.4f_%.4f' % (
@@ -251,6 +311,13 @@ def test():
     print('Begin testing...')
     loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, False)
     print('Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' % (loss, r1, r2, rl))
+
+
+def save_embed(vocab, path):
+    with open(path, 'w') as f:
+        f.write(str(len(vocab.word2id)) + ' ' + str(len(vocab.embed[0])) + '\n')
+        for i in range(vocab.word_num):
+            f.write(vocab.id2word[i] + ' ' + ' '.join(str(_) for _ in vocab.embed[i]) + '\n')
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 # coding=utf-8
 import torch
 import numpy as np
+import torch.utils.data as data
 
 
 # Vocab: 词典，由两部分组成
@@ -19,7 +20,7 @@ class Vocab:
         self.SOS_TOKEN = '<SOS>'
         self.EOS_TOKEN = '<EOS>'
         self.UNK_TOKEN = '<UNK>'
-        self.word_num = 4   # 词表总大小，包括固定部分和可变部分
+        self.word_num = 4  # 词表总大小，包括固定部分和可变部分
         self.fixed_num = 4  # 固定部分大小
         self.word2id = {self.PAD_TOKEN: self.PAD_IDX, self.SOS_TOKEN: self.SOS_IDX, self.EOS_TOKEN: self.EOS_IDX,
                         self.UNK_TOKEN: self.UNK_IDX}
@@ -29,9 +30,11 @@ class Vocab:
         self.user_num = 1
         self.user2id = {'<UNK-USER>': 0}
         self.id2user = {0: '<UNK-USER>'}
+        self.user2cnt = {'<UNK-USER>': 10000}
         self.product_num = 1
         self.product2id = {'<UNK-PRODUCT>': 0}
         self.id2product = {0: '<UNK-PRODUCT>'}
+        self.product2cnt = {'<UNK-PRODUCT>': 10000}
         for i in range(4):
             self.embed.append(np.random.normal(size=args.embed_dim))
         if embed is not None:
@@ -62,16 +65,23 @@ class Vocab:
         if user not in self.user2id:
             self.user2id[user] = self.user_num
             self.id2user[self.user_num] = user
+            self.user2cnt[user] = 1
             self.user_num += 1
+        else:
+            self.user2cnt[user] += 1
 
     # 读取一个产品，更新产品列表
     def add_product(self, product):
         if product not in self.product2id:
             self.product2id[product] = self.product_num
             self.id2product[self.product_num] = product
+            self.product2cnt[product] = 1
             self.product_num += 1
+        else:
+            self.product2cnt[product] += 1
 
-    # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量
+    # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量，
+    # 同时对user列表和product列表进行剪枝，只保留常见user和常见product
     def trim(self):
         print('original vocab size: %d' % len(self.word2cnt))
         reserved_words, reserved_idx = [], []
@@ -98,6 +108,37 @@ class Vocab:
         embed = torch.FloatTensor(embed)
         if self.args.use_cuda:
             embed = embed.cuda()
+
+        print('original user num = %d, product num = %d' % (self.user_num, self.product_num))
+        reserved_user, reserved_product = [], []
+        for i in range(self.user_num):
+            u = self.id2user[i]
+            if self.user2cnt[u] >= 10:
+                reserved_user.append(u)
+        cnt = 0
+        user2id, id2user, user2cnt = {}, {}, {}
+        for u in reserved_user:
+            user2id[u] = cnt
+            id2user[cnt] = u
+            user2cnt[u] = self.user2cnt[u]
+            cnt += 1
+        self.user_num = cnt
+        self.user2id, self.id2user, self.user2cnt = user2id, id2user, user2cnt
+
+        for i in range(self.product_num):
+            p = self.id2product[i]
+            if self.product2cnt[p] >= 10:
+                reserved_product.append(p)
+        cnt = 0
+        product2id, id2product, product2cnt = {}, {}, {}
+        for p in reserved_product:
+            product2id[p] = cnt
+            id2product[cnt] = p
+            product2cnt[p] = self.product2cnt[p]
+            cnt += 1
+        self.product_num = cnt
+        self.product2id, self.id2product, self.product2cnt = product2id, id2product, product2cnt
+        print('user num = %d, product num = %d' % (self.user_num, self.product_num))
         return embed
 
     def word_id(self, w):
@@ -168,12 +209,13 @@ class Vocab:
             trg_lens.append(len(summary))
 
         src_user, src_product = [], []
-        for user in batch['userID']:
+        for i in idx:
+            user = batch['userID'][i]
+            product = batch['productID'][i]
             if user in self.user2id:
                 src_user.append(self.user2id[user])
             else:
                 src_user.append(0)
-        for product in batch['productID']:
             if product in self.product2id:
                 src_product.append(self.product2id[product])
             else:
@@ -188,3 +230,17 @@ class Vocab:
             src_user, src_product = src_user.cuda(), src_product.cuda()
 
         return src, trg, src_embed, trg_embed, src_user, src_product, src_mask, src_lens, trg_lens, src_text, trg_text
+
+
+class Dataset(data.Dataset):
+    def __init__(self, examples):
+        super(Dataset, self).__init__()
+        self.examples = examples
+        self.training = False
+
+    def __getitem__(self, idx):
+        ex = self.examples[idx]
+        return ex
+
+    def __len__(self):
+        return len(self.examples)

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from beam import Beam
 
 
 class EncoderDecoder(nn.Module):
@@ -55,25 +56,9 @@ class EncoderDecoder(nn.Module):
                 dim=-1)
 
         # 计算copy mode下的word distribution，非src中的词概率为0
-        """
-        # 并行化的计算方式，同时计算整个batch的copy_prob，结果空间占用太多，batch_size > 2时超出显存，故放弃此法
-        src = src.unsqueeze(-1)
-        one_hot = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_(2, src, 1)
-        attn_probs = attn_probs.squeeze(1).unsqueeze(-1)
-        copy_prob = torch.sum(torch.mul(one_hot, attn_probs), 1).unsqueeze(1)
-        """
-
         src = src.unsqueeze(1)
         copy_prob = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_add(2, src, attn_probs)
 
-        """
-        copy_prob = torch.zeros(gen_prob.size()).cuda()
-        for i in range(copy_prob.size(0)):
-            for j, idx in enumerate(src[i]):
-                if idx == 0:
-                    break
-                copy_prob[i][0][idx] += attn_probs[i][0][j]
-        """
         # 计算generate的概率p
         gen_p = F.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
         mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
@@ -114,9 +99,9 @@ class EncoderDecoder(nn.Module):
                     prev_embed = trg_embed[:, i - 1].unsqueeze(1)
                 else:  # last predicted word embedding
                     prev_idx = torch.argmax(pre_output_vectors[-1], dim=-1)
-                    for i in range(0, prev_idx.size(0)):
-                        if prev_idx[i][0] >= self.args.embed_num:
-                            prev_idx[i][0] = 3  # UNK_IDX
+                    for j in range(0, prev_idx.size(0)):
+                        if prev_idx[j][0] >= self.args.embed_num:
+                            prev_idx[j][0] = 3  # UNK_IDX
                     prev_embed = self.embed(prev_idx)
             hidden, context_hidden, word_prob = self.decode_step(src, prev_embed, encoder_hidden, src_mask, proj_key,
                                                                  hidden, context_hidden, vocab_size)
@@ -124,6 +109,74 @@ class EncoderDecoder(nn.Module):
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
 
         return pre_output_vectors
+
+    # 使用beam_search搜索最好的beam_size个结果
+    def beam_search(self, src, src_, vocab_size, src_mask, src_lens):
+        # embed input
+        src_embed = self.embed(src_)  # [B, S, D]
+
+        # feed input to encoder RNN
+        packed = pack_padded_sequence(src_embed, src_lens, batch_first=True)
+        encoder_hidden, encoder_final = self.encoder_rnn(packed)
+        encoder_hidden, _ = pad_packed_sequence(encoder_hidden, batch_first=True)  # encoder_hidden: [B, S, 2H]
+
+        # get encoder final state, will be used as decoder initial state
+        fwd_final = encoder_final[0:encoder_final.size(0):2]
+        bwd_final = encoder_final[1:encoder_final.size(0):2]
+        encoder_final = torch.cat([fwd_final, bwd_final], dim=2)  # encoder_final: [num_layers, B, 2H]
+
+        max_len = self.args.sum_max_len
+        hidden = torch.tanh(self.init_hidden(encoder_final))
+        context_hidden = hidden[-1].unsqueeze(1)
+
+        # pre-compute projected encoder hidden states(the "keys" for the attention mechanism)
+        # this is only done for efficiency
+        proj_key = self.attention.key_layer(encoder_hidden)
+
+        batch_size = len(src)
+        beam_size = 1
+        beam_list = []
+        sos = torch.cuda.LongTensor([1])
+        for b in range(batch_size):
+            cur_src = src[b].repeat(beam_size, 1)
+            cur_encoder_hidden = encoder_hidden[b].repeat(beam_size, 1, 1)
+            cur_src_mask = src_mask[b].repeat(beam_size, 1)
+            cur_proj_key = proj_key[b].repeat(beam_size, 1, 1)
+
+            cur_hidden = hidden[:, b].unsqueeze(1).repeat(1, beam_size, 1)
+            cur_context_hidden = context_hidden[b].repeat(beam_size, 1, 1)
+
+            cur_prev_embed = self.embed(sos).repeat(len(cur_src), 1).unsqueeze(1)
+            cur_hidden, cur_context_hidden, word_prob = self.decode_step(cur_src, cur_prev_embed, cur_encoder_hidden,
+                                                                         cur_src_mask, cur_proj_key, cur_hidden,
+                                                                         cur_context_hidden, vocab_size)
+            word_prob = torch.log(word_prob + 1e-20)
+            cur_beam = Beam(beam_size, cur_hidden[:, 0], cur_context_hidden[0], word_prob[0][0])
+            for i in range(max_len - 1):
+                word_idx = []
+                cur_hidden = []
+                cur_context_hidden = []
+                for j in range(beam_size):
+                    word_idx.append(cur_beam.seqs[j][-1])
+                    cur_hidden.append(cur_beam.hidden[j])
+                    cur_context_hidden.append(cur_beam.context_hidden[j])
+                word_idx = torch.stack(word_idx)
+                cur_hidden = torch.stack(cur_hidden, dim=1)
+                cur_context_hidden = torch.stack(cur_context_hidden)
+                for j in range(beam_size):
+                    if word_idx[j] >= self.args.embed_num:
+                        word_idx[j] = 3
+                cur_prev_embed = self.embed(word_idx).view(beam_size, 1, -1)
+                cur_hidden, cur_context_hidden, word_prob = self.decode_step(cur_src, cur_prev_embed,
+                                                                             cur_encoder_hidden,
+                                                                             cur_src_mask, cur_proj_key, cur_hidden,
+                                                                             cur_context_hidden, vocab_size)
+                cur_beam.update(torch.log(word_prob.squeeze(1) + 1e-20), cur_hidden, cur_context_hidden)
+                if cur_beam.done():
+                    break
+            beam_list.append(cur_beam)
+
+        return beam_list
 
     def save(self, dir):
         checkpoint = {'model': self.state_dict(), 'args': self.args}
