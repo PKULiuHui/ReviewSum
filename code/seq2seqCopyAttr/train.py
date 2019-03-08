@@ -20,7 +20,7 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='seq2seqCopyAttr')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints2/')
+parser.add_argument('-save_path', type=str, default='checkpoints4/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
 parser.add_argument('-attr_embed_path', type=str, default=None)
 parser.add_argument('-train_dir', type=str, default='../../data/aligned/train/')
@@ -45,7 +45,7 @@ parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay', type=float, default=0.5)
 parser.add_argument('-max_norm', type=float, default=5.0)
-parser.add_argument('-batch_size', type=int, default=64)
+parser.add_argument('-batch_size', type=int, default=32)
 parser.add_argument('-epochs', type=int, default=12)
 parser.add_argument('-seed', type=int, default=2333)
 parser.add_argument('-print_every', type=int, default=10)
@@ -197,7 +197,7 @@ def train():
     args.product_num = vocab.product_num
 
     train_dataset = Dataset(train_data)
-    val_dataset = Dataset(val_data)
+    val_dataset = Dataset(test_data)
     train_iter = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True)
     val_iter = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -306,7 +306,7 @@ def test():
     args.embed_dim = len(embed[0])
     args.user_num = vocab.user_num
     args.product_num = vocab.product_num
-    test_dataset = Dataset(val_data)
+    test_dataset = Dataset(test_data)
     test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
 
     print('Loading model...')

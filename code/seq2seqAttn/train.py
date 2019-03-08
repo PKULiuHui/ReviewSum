@@ -21,11 +21,11 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='seq2seqAttn')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints4/')
-parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.unaligned.txt')
-parser.add_argument('-train_dir', type=str, default='../../data/unaligned/train/')
-parser.add_argument('-valid_dir', type=str, default='../../data/unaligned/valid/')
-parser.add_argument('-test_dir', type=str, default='../../data/unaligned/test/')
+parser.add_argument('-save_path', type=str, default='checkpoints/')
+parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.review.txt')
+parser.add_argument('-train_dir', type=str, default='../../data/aligned/train/')
+parser.add_argument('-valid_dir', type=str, default='../../data/aligned/valid/')
+parser.add_argument('-test_dir', type=str, default='../../data/aligned/test/')
 parser.add_argument('-load_model', type=str, default='')
 parser.add_argument('-output_dir', type=str, default='output/')
 parser.add_argument('-example_num', type=int, default=4)
@@ -41,7 +41,7 @@ parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay', type=float, default=0.5)
 parser.add_argument('-max_norm', type=float, default=5.0)
-parser.add_argument('-batch_size', type=int, default=64)
+parser.add_argument('-batch_size', type=int, default=32)
 parser.add_argument('-epochs', type=int, default=10)
 parser.add_argument('-seed', type=int, default=2333)
 parser.add_argument('-print_every', type=int, default=10)
@@ -82,7 +82,7 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
         loss += criterion(pre_output, trg_output).data.item() / len(src_lens)
         reviews.extend(src_text)
         refs.extend(trg_text)
-        # pre[:, :, 3] = float('-inf')
+        pre[:, :, 3] = float('-inf')
         rst = torch.argmax(pre, dim=-1).tolist()
         for i, summary in enumerate(rst):
             cur_sum = ['']
@@ -238,7 +238,7 @@ def test():
     embed = vocab.trim()
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
-    test_dataset = Dataset(val_data)
+    test_dataset = Dataset(test_data)
     test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
 
     print('Loading model...')

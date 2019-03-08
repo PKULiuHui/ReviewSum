@@ -5,11 +5,11 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
-class MemBasic(nn.Module):
+class MemCopy(nn.Module):
 
     def __init__(self, args, embed):
-        super(MemBasic, self).__init__()
-        self.name = 'seq2seqAttn + memory'
+        super(MemCopy, self).__init__()
+        self.name = 'seq2seqAttnCopy + memory'
         self.args = args
         # Embedding layer, shared by all encoders and decoder
         self.embed = nn.Embedding(args.embed_num, args.embed_dim)
@@ -30,11 +30,15 @@ class MemBasic(nn.Module):
         self.decoder_rnn = nn.GRU(args.embed_dim + args.hidden_size + 2 * args.hidden_size, args.hidden_size,
                                   args.rnn_layers, batch_first=True, dropout=args.decoder_dropout)
         self.init_hidden = nn.Linear(2 * args.hidden_size, args.hidden_size)
-        self.dropout_layer = nn.Dropout(p=args.decoder_dropout)
         self.context_hidden = nn.Linear(3 * args.hidden_size, args.hidden_size, bias=False)
+        # generate mode probability layer
+        self.gen_p = nn.Linear(3 * args.hidden_size + args.embed_dim, 1)
+        # generate mode layer, context_hidden => word distribution over fixed vocab, P(changeable vocab) = 0
         self.generator = nn.Linear(args.hidden_size, args.embed_num, bias=False)
+        # copy mode layer, no learnable paras, attn_scores => word distribution over src vocab, P(other vocab) = 0
 
-    def decode_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden, mem_out):
+    def decode_step(self, src, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden, mem_out,
+                    vocab_size):
         """Perform a single decoder step (1 word)"""
 
         # update rnn hidden state
@@ -44,20 +48,32 @@ class MemBasic(nn.Module):
         # compute context vector using attention mechanism
         query = hidden[-1].unsqueeze(1)  # [B, 1, H]
         context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
+
+        # 计算generate mode下的word distribution，非固定词表部分概率为0
         context_hidden = F.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
-        pre_output = self.dropout_layer(context_hidden)
-        pre_output = self.generator(pre_output)
+        gen_prob = F.softmax(self.generator(context_hidden), dim=-1)
+        if vocab_size > gen_prob.size(2):
+            gen_prob = torch.cat(
+                [gen_prob, torch.zeros(gen_prob.size(0), gen_prob.size(1), vocab_size - gen_prob.size(2)).cuda()],
+                dim=-1)
 
-        return hidden, context_hidden, pre_output
+        # 计算copy mode下的word distribution，非src中的词概率为0
+        src = src.unsqueeze(1)
+        copy_prob = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_add(2, src, attn_probs)
 
-    def forward(self, src, trg, mem_up, mem_review, mem_sum, test=False):
+        # 计算generate的概率p
+        gen_p = F.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
+        mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
+        return hidden, context_hidden, mix_prob
+
+    def forward(self, src, trg, src_, trg_, vocab_size, mem_up, mem_review, mem_sum, test=False):
         # useful variables
         batch_size = len(src)
         mem_size = self.args.mem_size
-        src_lens = torch.sum(torch.sign(src), dim=1).data
-        src_mask = torch.sign(src)
-        mem_review_lens = torch.sum(torch.sign(mem_review), dim=1).data
-        mem_sum_lens = torch.sum(torch.sign(mem_sum), dim=1).data
+        src_lens = torch.sum(torch.sign(src), dim=1).tolist()
+        src_mask = torch.sign(src).data
+        mem_review_lens = torch.sum(torch.sign(mem_review), dim=1)
+        mem_sum_lens = torch.sum(torch.sign(mem_sum), dim=1)
         mem_up = mem_up.view(batch_size, mem_size, 2)
 
         # sort mem_review and mem_sum according to text lens, save idxs
@@ -65,15 +81,9 @@ class MemBasic(nn.Module):
         mem_review_sorted = torch.index_select(mem_review, 0, mem_review_idx)
         mem_sum_lens, mem_sum_idx = torch.sort(mem_sum_lens, descending=True)
         mem_sum_sorted = torch.index_select(mem_sum, 0, mem_sum_idx)
-        """
-        _, idx2 = torch.sort(mem_sum_idx)
-        tmp = torch.index_select(mem_sum_sorted, 0, idx2)
-        print(mem_sum[4:8])
-        print(tmp[4:8])
-        exit()
-        """
+
         # embed text(src, mem_review, mem_sum)
-        src_embed = self.embed(src)  # x: [B, S, D]
+        src_embed = self.embed(src_)  # x: [B, S, D]
         mem_review_embed = self.embed(mem_review_sorted)
         mem_sum_embed = self.embed(mem_sum_sorted)
 
@@ -109,7 +119,7 @@ class MemBasic(nn.Module):
                 batch_size, -1)
             query = self.new_query(torch.cat([query, mem_out], dim=-1))
 
-        trg_embed = self.embed(trg)
+        trg_embed = self.embed(trg_)
         max_len = self.args.sum_max_len
         hidden = torch.tanh(self.init_hidden(encoder_final))
         context_hidden = hidden[-1].unsqueeze(1)  # context_hidden指融合了context信息的hidden，初始化为hidden[-1]
@@ -128,11 +138,14 @@ class MemBasic(nn.Module):
                     prev_embed = trg_embed[:, i - 1].unsqueeze(1)
                 else:  # last predicted word embedding
                     prev_idx = torch.argmax(pre_output_vectors[-1], dim=-1)
+                    for j in range(0, prev_idx.size(0)):
+                        if prev_idx[j][0] >= self.args.embed_num:
+                            prev_idx[j][0] = 3  # UNK_IDX
                     prev_embed = self.embed(prev_idx)
-            hidden, context_hidden, pre_output = self.decode_step(prev_embed, encoder_hidden, src_mask, proj_key,
-                                                                  hidden, context_hidden, mem_out.unsqueeze(1))
-            pre_output_vectors.append(F.log_softmax(pre_output, dim=-1))
-
+            hidden, context_hidden, word_prob = self.decode_step(src, prev_embed, encoder_hidden, src_mask, proj_key,
+                                                                 hidden, context_hidden, mem_out.unsqueeze(1),
+                                                                 vocab_size)
+            pre_output_vectors.append(word_prob)
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
 
         return key_score, pre_output_vectors
@@ -188,15 +201,18 @@ class Attention(nn.Module):
 class MyLoss(nn.Module):
     def __init__(self, args):
         super(MyLoss, self).__init__()
+        assert args.loss_type == 'text' or args.loss_type == 'mix'
         self.type = args.loss_type
         self.temp = args.mem_loss_temp
+        self.ratio = args.mem_loss_ratio
 
     def forward(self, mem_output, sum_output, mem_output_gold, sum_output_gold):
         nll_loss = nn.NLLLoss(ignore_index=0, size_average=False)
-        loss = nll_loss(sum_output, sum_output_gold)
+        loss_1 = nll_loss(sum_output, sum_output_gold)
         if self.type == 'text':
-            return loss
+            return loss_1, loss_1, loss_1
         mem_output_gold = F.softmax(mem_output_gold * self.temp, dim=-1)
-        kl_div_loss = -nn.KLDivLoss(size_average=False) / mem_output.size(-1)
-        loss += kl_div_loss(mem_output, mem_output_gold)
-        return loss
+        kl_div_loss = nn.KLDivLoss(size_average=False)
+        loss_2 = self.ratio * kl_div_loss(torch.log(mem_output + 1e-20), mem_output_gold)
+        loss = loss_1 + loss_2
+        return loss, loss_1, loss_2

@@ -5,11 +5,11 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
-class MemBasic(nn.Module):
+class MemCopySplit(nn.Module):
 
     def __init__(self, args, embed):
-        super(MemBasic, self).__init__()
-        self.name = 'seq2seqAttn + memory'
+        super(MemCopySplit, self).__init__()
+        self.name = 'seq2seqAttnCopy + user memory / product memory'
         self.args = args
         # Embedding layer, shared by all encoders and decoder
         self.embed = nn.Embedding(args.embed_num, args.embed_dim)
@@ -22,19 +22,24 @@ class MemBasic(nn.Module):
         self.sum_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.rnn_layers, batch_first=True,
                                   bidirectional=True, dropout=args.sum_encoder_dropout)
         # Memory Scoring layer
-        self.key_score = nn.Linear(3, 1)  # [u : p : ri·rj] => similarity_score
         self.new_query = nn.Linear(4 * args.hidden_size, 2 * args.hidden_size)  # [query : mem_out] => new_query
+        # Memory fusion layer
+        self.mem_fusion = nn.Linear(4 * args.hidden_size, 2 * args.hidden_size)
         # Attention
         self.attention = Attention(args.hidden_size)
         # Decoder
         self.decoder_rnn = nn.GRU(args.embed_dim + args.hidden_size + 2 * args.hidden_size, args.hidden_size,
                                   args.rnn_layers, batch_first=True, dropout=args.decoder_dropout)
         self.init_hidden = nn.Linear(2 * args.hidden_size, args.hidden_size)
-        self.dropout_layer = nn.Dropout(p=args.decoder_dropout)
         self.context_hidden = nn.Linear(3 * args.hidden_size, args.hidden_size, bias=False)
+        # generate mode probability layer
+        self.gen_p = nn.Linear(3 * args.hidden_size + args.embed_dim, 1)
+        # generate mode layer, context_hidden => word distribution over fixed vocab, P(changeable vocab) = 0
         self.generator = nn.Linear(args.hidden_size, args.embed_num, bias=False)
+        # copy mode layer, no learnable paras, attn_scores => word distribution over src vocab, P(other vocab) = 0
 
-    def decode_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden, mem_out):
+    def decode_step(self, src, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden, mem_out,
+                    vocab_size):
         """Perform a single decoder step (1 word)"""
 
         # update rnn hidden state
@@ -44,72 +49,105 @@ class MemBasic(nn.Module):
         # compute context vector using attention mechanism
         query = hidden[-1].unsqueeze(1)  # [B, 1, H]
         context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
+
+        # 计算generate mode下的word distribution，非固定词表部分概率为0
         context_hidden = F.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
-        pre_output = self.dropout_layer(context_hidden)
-        pre_output = self.generator(pre_output)
+        gen_prob = F.softmax(self.generator(context_hidden), dim=-1)
+        if vocab_size > gen_prob.size(2):
+            gen_prob = torch.cat(
+                [gen_prob, torch.zeros(gen_prob.size(0), gen_prob.size(1), vocab_size - gen_prob.size(2)).cuda()],
+                dim=-1)
 
-        return hidden, context_hidden, pre_output
+        # 计算copy mode下的word distribution，非src中的词概率为0
+        src = src.unsqueeze(1)
+        copy_prob = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_add(2, src, attn_probs)
 
-    def forward(self, src, trg, mem_up, mem_review, mem_sum, test=False):
+        # 计算generate的概率p
+        gen_p = F.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
+        mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
+        return hidden, context_hidden, mix_prob
+
+    def forward(self, src, trg, src_, trg_, vocab_size, u_review, u_sum, p_review, p_sum, test=False):
         # useful variables
         batch_size = len(src)
         mem_size = self.args.mem_size
-        src_lens = torch.sum(torch.sign(src), dim=1).data
-        src_mask = torch.sign(src)
-        mem_review_lens = torch.sum(torch.sign(mem_review), dim=1).data
-        mem_sum_lens = torch.sum(torch.sign(mem_sum), dim=1).data
-        mem_up = mem_up.view(batch_size, mem_size, 2)
+        src_lens = torch.sum(torch.sign(src), dim=1).tolist()
+        src_mask = torch.sign(src).data
+        u_review_lens = torch.sum(torch.sign(u_review), dim=1).data
+        u_sum_lens = torch.sum(torch.sign(u_sum), dim=1).data
+        p_review_lens = torch.sum(torch.sign(p_review), dim=1).data
+        p_sum_lens = torch.sum(torch.sign(p_sum), dim=1).data
 
         # sort mem_review and mem_sum according to text lens, save idxs
-        mem_review_lens, mem_review_idx = torch.sort(mem_review_lens, descending=True)
-        mem_review_sorted = torch.index_select(mem_review, 0, mem_review_idx)
-        mem_sum_lens, mem_sum_idx = torch.sort(mem_sum_lens, descending=True)
-        mem_sum_sorted = torch.index_select(mem_sum, 0, mem_sum_idx)
-        """
-        _, idx2 = torch.sort(mem_sum_idx)
-        tmp = torch.index_select(mem_sum_sorted, 0, idx2)
-        print(mem_sum[4:8])
-        print(tmp[4:8])
-        exit()
-        """
+        u_review_lens, u_review_idx = torch.sort(u_review_lens, descending=True)
+        u_review = torch.index_select(u_review, 0, u_review_idx)
+        u_sum_lens, u_sum_idx = torch.sort(u_sum_lens, descending=True)
+        u_sum = torch.index_select(u_sum, 0, u_sum_idx)
+        p_review_lens, p_review_idx = torch.sort(p_review_lens, descending=True)
+        p_review = torch.index_select(p_review, 0, p_review_idx)
+        p_sum_lens, p_sum_idx = torch.sort(p_sum_lens, descending=True)
+        p_sum = torch.index_select(p_sum, 0, p_sum_idx)
+
         # embed text(src, mem_review, mem_sum)
-        src_embed = self.embed(src)  # x: [B, S, D]
-        mem_review_embed = self.embed(mem_review_sorted)
-        mem_sum_embed = self.embed(mem_sum_sorted)
+        src_ = self.embed(src_)  # x: [B, S, D]
+        u_review = self.embed(u_review)
+        u_sum = self.embed(u_sum)
+        p_review = self.embed(p_review)
+        p_sum = self.embed(p_sum)
 
         # feed text into encoders
-        packed = pack_padded_sequence(src_embed, src_lens, batch_first=True)
+        packed = pack_padded_sequence(src_, src_lens, batch_first=True)
         encoder_hidden, encoder_final = self.review_encoder(packed)
         encoder_hidden, _ = pad_packed_sequence(encoder_hidden, batch_first=True)  # encoder_hidden: [B, S, 2H]
         fwd_final = encoder_final[0:encoder_final.size(0):2]
         bwd_final = encoder_final[1:encoder_final.size(0):2]
         encoder_final = torch.cat([fwd_final, bwd_final], dim=2)  # encoder_final: [num_layers, B, 2H]
 
-        review_packed = pack_padded_sequence(mem_review_embed, mem_review_lens, batch_first=True)
-        _, review_final = self.review_encoder(review_packed)
-        review_final = \
+        packed = pack_padded_sequence(u_review, u_review_lens, batch_first=True)
+        _, review_final = self.review_encoder(packed)
+        u_review_final = \
             torch.cat([review_final[0:review_final.size(0):2], review_final[1:review_final.size(0):2]], dim=2)[-1]
-        _, idx2 = torch.sort(mem_review_idx)
-        review_final = torch.index_select(review_final, 0, idx2)
+        _, idx2 = torch.sort(u_review_idx)
+        u_review_final = torch.index_select(u_review_final, 0, idx2)
 
-        sum_packed = pack_padded_sequence(mem_sum_embed, mem_sum_lens, batch_first=True)
-        _, sum_final = self.sum_encoder(sum_packed)
-        sum_final = torch.cat([sum_final[0:sum_final.size(0):2], sum_final[1:sum_final.size(0):2]], dim=2)[-1]
-        _, idx2 = torch.sort(mem_sum_idx)
-        sum_final = torch.index_select(sum_final, 0, idx2)
+        packed = pack_padded_sequence(p_review, p_review_lens, batch_first=True)
+        _, review_final = self.review_encoder(packed)
+        p_review_final = \
+            torch.cat([review_final[0:review_final.size(0):2], review_final[1:review_final.size(0):2]], dim=2)[-1]
+        _, idx2 = torch.sort(p_review_idx)
+        p_review_final = torch.index_select(p_review_final, 0, idx2)
+
+        packed = pack_padded_sequence(u_sum, u_sum_lens, batch_first=True)
+        _, sum_final = self.sum_encoder(packed)
+        u_sum_final = torch.cat([sum_final[0:sum_final.size(0):2], sum_final[1:sum_final.size(0):2]], dim=2)[-1]
+        _, idx2 = torch.sort(u_sum_idx)
+        u_sum_final = torch.index_select(u_sum_final, 0, idx2)
+
+        packed = pack_padded_sequence(p_sum, p_sum_lens, batch_first=True)
+        _, sum_final = self.sum_encoder(packed)
+        p_sum_final = torch.cat([sum_final[0:sum_final.size(0):2], sum_final[1:sum_final.size(0):2]], dim=2)[-1]
+        _, idx2 = torch.sort(p_sum_idx)
+        p_sum_final = torch.index_select(p_sum_final, 0, idx2)
 
         query = encoder_final[-1]
         for i in range(self.args.mem_layers):
             query_extend = query.repeat(1, mem_size).view(-1, query.size(-1))
             review_sim = torch.bmm(query_extend.view(query_extend.size(0), 1, -1),
-                                   review_final.view(review_final.size(0), -1, 1)).view(batch_size, mem_size, 1)
-            key_score = F.softmax(self.key_score(torch.cat([mem_up, review_sim], dim=-1)).view(batch_size, mem_size),
-                                  dim=-1)
-            mem_out = torch.bmm(key_score.view(batch_size, 1, mem_size), sum_final.view(batch_size, mem_size, -1)).view(
-                batch_size, -1)
+                                   u_review_final.view(u_review_final.size(0), -1, 1)).view(batch_size, mem_size, 1)
+            key_score = F.softmax(review_sim.view(batch_size, mem_size), dim=-1)
+            u_mem_out = torch.bmm(key_score.view(batch_size, 1, mem_size),
+                                  u_sum_final.view(batch_size, mem_size, -1)).view(batch_size, -1)
+
+            review_sim = torch.bmm(query_extend.view(query_extend.size(0), 1, -1),
+                                   p_review_final.view(p_review_final.size(0), -1, 1)).view(batch_size, mem_size, 1)
+            key_score = F.softmax(review_sim.view(batch_size, mem_size), dim=-1)
+            p_mem_out = torch.bmm(key_score.view(batch_size, 1, mem_size),
+                                  p_sum_final.view(batch_size, mem_size, -1)).view(batch_size, -1)
+
+            mem_out = self.mem_fusion(torch.cat([u_mem_out, p_mem_out], dim=-1))
             query = self.new_query(torch.cat([query, mem_out], dim=-1))
 
-        trg_embed = self.embed(trg)
+        trg_embed = self.embed(trg_)
         max_len = self.args.sum_max_len
         hidden = torch.tanh(self.init_hidden(encoder_final))
         context_hidden = hidden[-1].unsqueeze(1)  # context_hidden指融合了context信息的hidden，初始化为hidden[-1]
@@ -128,14 +166,17 @@ class MemBasic(nn.Module):
                     prev_embed = trg_embed[:, i - 1].unsqueeze(1)
                 else:  # last predicted word embedding
                     prev_idx = torch.argmax(pre_output_vectors[-1], dim=-1)
+                    for j in range(0, prev_idx.size(0)):
+                        if prev_idx[j][0] >= self.args.embed_num:
+                            prev_idx[j][0] = 3  # UNK_IDX
                     prev_embed = self.embed(prev_idx)
-            hidden, context_hidden, pre_output = self.decode_step(prev_embed, encoder_hidden, src_mask, proj_key,
-                                                                  hidden, context_hidden, mem_out.unsqueeze(1))
-            pre_output_vectors.append(F.log_softmax(pre_output, dim=-1))
-
+            hidden, context_hidden, word_prob = self.decode_step(src, prev_embed, encoder_hidden, src_mask, proj_key,
+                                                                 hidden, context_hidden, mem_out.unsqueeze(1),
+                                                                 vocab_size)
+            pre_output_vectors.append(word_prob)
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
 
-        return key_score, pre_output_vectors
+        return pre_output_vectors
 
     def save(self, dir):
         checkpoint = {'model': self.state_dict(), 'args': self.args}
@@ -183,20 +224,3 @@ class Attention(nn.Module):
 
         # context shape: [B, 1, 2*H], alphas shape: [B, 1, max_len]
         return context, alphas
-
-
-class MyLoss(nn.Module):
-    def __init__(self, args):
-        super(MyLoss, self).__init__()
-        self.type = args.loss_type
-        self.temp = args.mem_loss_temp
-
-    def forward(self, mem_output, sum_output, mem_output_gold, sum_output_gold):
-        nll_loss = nn.NLLLoss(ignore_index=0, size_average=False)
-        loss = nll_loss(sum_output, sum_output_gold)
-        if self.type == 'text':
-            return loss
-        mem_output_gold = F.softmax(mem_output_gold * self.temp, dim=-1)
-        kl_div_loss = -nn.KLDivLoss(size_average=False) / mem_output.size(-1)
-        loss += kl_div_loss(mem_output, mem_output_gold)
-        return loss

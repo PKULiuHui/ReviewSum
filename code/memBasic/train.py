@@ -18,11 +18,11 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='memBasic')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints1/')
-parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.unaligned.txt')
-parser.add_argument('-train_dir', type=str, default='../../data/unaligned_memory/train/')
-parser.add_argument('-valid_dir', type=str, default='../../data/unaligned_memory/valid/')
-parser.add_argument('-test_dir', type=str, default='../../data/unaligned_memory/test/')
+parser.add_argument('-save_path', type=str, default='checkpoints2/')
+parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
+parser.add_argument('-train_dir', type=str, default='../../data/aligned_memory/train/')
+parser.add_argument('-valid_dir', type=str, default='../../data/aligned_memory/valid/')
+parser.add_argument('-test_dir', type=str, default='../../data/aligned_memory/test/')
 parser.add_argument('-load_model', type=str, default='')
 parser.add_argument('-output_dir', type=str, default='output/')
 parser.add_argument('-example_num', type=int, default=4)
@@ -30,24 +30,26 @@ parser.add_argument('-example_num', type=int, default=4)
 parser.add_argument('-embed_dim', type=int, default=300)
 parser.add_argument('-embed_num', type=int, default=0)
 parser.add_argument('-word_min_cnt', type=int, default=20)
-parser.add_argument('-review_max_len', type=int, default=260)
+parser.add_argument('-review_max_len', type=int, default=280)
 parser.add_argument('-sum_max_len', type=int, default=15)
 parser.add_argument('-hidden_size', type=int, default=512)
 parser.add_argument('-rnn_layers', type=int, default=2)
-parser.add_argument('-mem_size', type=int, default=100)
+parser.add_argument('-mem_size', type=int, default=10)
 parser.add_argument('-mem_layers', type=int, default=2)
 parser.add_argument('-review_encoder_dropout', type=float, default=0.1)
-parser.add_argument('-sum_encoder_dropout', type=float, default=0.1)
+parser.add_argument('-sum_encoder_dropout', type=float, default=0.2)
 parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay_ratio', type=float, default=0.5)
 parser.add_argument('-lr_decay_start', type=int, default=10)
+parser.add_argument('-loss_type', type=str, default='text')
+parser.add_argument('-mem_loss_temp', type=float, default=10)
 parser.add_argument('-max_norm', type=float, default=5.0)
-parser.add_argument('-batch_size', type=int, default=5)
+parser.add_argument('-batch_size', type=int, default=10)
 parser.add_argument('-epochs', type=int, default=10)
 parser.add_argument('-seed', type=int, default=2333)
-parser.add_argument('-print_every', type=int, default=10)
-parser.add_argument('-valid_every', type=int, default=1000)
+parser.add_argument('-print_every', type=int, default=20)
+parser.add_argument('-valid_every', type=int, default=5000)
 parser.add_argument('-test', action='store_true')
 parser.add_argument('-use_cuda', type=bool, default=False)
 
@@ -77,7 +79,7 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
     reviews = []
     refs = []
     sums = []
-    loss, mem_loss, sum_loss, r1, r2, rl = .0, .0, .0, .0, .0, .0
+    loss, r1, r2, rl = .0, .0, .0, .0
     rouge = RougeCalculator(stopwords=False, lang="en")
     for batch in tqdm(data_iter):
         src, trg, mem_up, mem_review, mem_sum, mem_gold, src_text, trg_text = vocab.make_tensors(batch, train_data)
@@ -86,13 +88,11 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
 
         mem_out_1 = mem_out_1.view(-1, mem_out_1.size(-1))
         sum_out_1 = sum_out_1.view(-1, sum_out_1.size(-1))
-        mem_out_gold = mem_gold.view(-1)
+        mem_out_gold = mem_gold.view(-1, mem_out_1.size(-1))
         sum_out_gold = trg.view(-1)
-        cur_loss, cur_mem_loss, cur_sum_loss = criterion(mem_out_1, sum_out_1, mem_out_gold, sum_out_gold)
+        cur_loss = criterion(mem_out_1, sum_out_1, mem_out_gold, sum_out_gold)
         batch_size = len(src)
         loss += cur_loss.data.item() / batch_size
-        mem_loss += cur_mem_loss.data.item() / batch_size
-        sum_loss += cur_sum_loss.data.item() / batch_size
         reviews.extend(src_text)
         refs.extend(trg_text)
         rst = torch.argmax(sum_out, dim=-1).tolist()
@@ -121,14 +121,12 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
                 f.write('= %s\n' % ref)
                 f.write('< %s\n\n' % summary)
     loss /= len(data_iter)
-    mem_loss /= len(data_iter)
-    sum_loss /= len(data_iter)
     r1 /= len(sums)
     r2 /= len(sums)
     rl /= len(sums)
     if train_next:
         net.train()
-    return loss, mem_loss, sum_loss, r1, r2, rl
+    return loss, r1, r2, rl
 
 
 def train():
@@ -182,7 +180,7 @@ def train():
     net = MemBasic(args, embed)
     if args.use_cuda:
         net.cuda()
-    criterion = MyLoss()
+    criterion = MyLoss(args)
     optim = torch.optim.Adam(net.parameters(), lr=args.lr)
 
     print('Begin training...')
@@ -194,13 +192,11 @@ def train():
             mem_output, sum_output = net(src, trg, mem_up, mem_review, mem_sum)
             mem_output = mem_output.view(-1, mem_output.size(-1))
             sum_output = sum_output.view(-1, sum_output.size(-1))
-            mem_output_gold = mem_gold.view(-1)
+            mem_output_gold = mem_gold.view(-1, mem_output.size(-1))
             sum_output_gold = trg.view(-1)
-            loss, mem_loss, sum_loss = criterion(mem_output, sum_output, mem_output_gold, sum_output_gold)
+            loss = criterion(mem_output, sum_output, mem_output_gold, sum_output_gold)
             batch_size = len(src)
             loss /= batch_size
-            mem_loss /= batch_size
-            sum_loss /= batch_size
             loss.backward()
             clip_grad_norm_(net.parameters(), args.max_norm)
             optim.step()
@@ -208,17 +204,17 @@ def train():
 
             cnt = (epoch - 1) * len(train_iter) + i
             if cnt % args.print_every == 0:
-                print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] mem_loss=%f sum_loss=%f loss=%f' % (
-                    epoch, args.epochs, i, len(train_iter), mem_loss.data, sum_loss.data, loss.data))
+                print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f' % (
+                    epoch, args.epochs, i, len(train_iter), loss.data))
 
             if cnt % args.valid_every == 0 and cnt / args.valid_every >= 0:
                 print('Begin valid... Epoch %d, Batch %d' % (epoch, i))
-                cur_loss, mem_loss, sum_loss, r1, r2, rl = evaluate(net, criterion, vocab, val_iter, train_data, True)
-                save_path = args.save_path + 'valid_%d_%.4f_%.4f_%.4f_%.4f_%.4f_%.4f' % (
-                    cnt / args.valid_every, cur_loss, mem_loss, sum_loss, r1, r2, rl)
+                cur_loss, r1, r2, rl = evaluate(net, criterion, vocab, val_iter, train_data, True)
+                save_path = args.save_path + 'valid_%d_%.4f_%.4f_%.4f_%.4f' % (
+                    cnt / args.valid_every, cur_loss, r1, r2, rl)
                 net.save(save_path)
-                print('Epoch: %2d Val_Loss: %f Mem_Loss: %f Sum_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' %
-                      (epoch, cur_loss, mem_loss, sum_loss, r1, r2, rl))
+                print('Epoch: %2d Val_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' %
+                      (epoch, cur_loss, r1, r2, rl))
     return
 
 
@@ -273,9 +269,8 @@ def test():
     criterion = MyLoss()
 
     print('Begin testing...')
-    loss, mem_loss, sum_loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, train_data, False)
-    print('Loss: %f Mem_Loss: %f Sum_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' %
-          (loss, mem_loss, sum_loss, r1, r2, rl))
+    loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, train_data, False)
+    print('Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' % (loss, r1, r2, rl))
 
 
 if __name__ == '__main__':

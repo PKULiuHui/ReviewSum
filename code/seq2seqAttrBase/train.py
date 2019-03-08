@@ -254,7 +254,7 @@ def test():
     embed = vocab.trim()
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
-    test_dataset = Dataset(val_data)
+    test_dataset = Dataset(test_data)
     test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
 
     print('Loading model...')
