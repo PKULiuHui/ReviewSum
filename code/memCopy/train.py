@@ -17,7 +17,7 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='memCopy')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints3/')
+parser.add_argument('-save_path', type=str, default='checkpoints4/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/aligned_memory/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/aligned_memory/valid/')
@@ -29,11 +29,11 @@ parser.add_argument('-example_num', type=int, default=4)
 parser.add_argument('-embed_dim', type=int, default=300)
 parser.add_argument('-embed_num', type=int, default=0)
 parser.add_argument('-word_min_cnt', type=int, default=20)
-parser.add_argument('-review_max_len', type=int, default=250)
+parser.add_argument('-review_max_len', type=int, default=200)
 parser.add_argument('-sum_max_len', type=int, default=15)
 parser.add_argument('-hidden_size', type=int, default=512)
 parser.add_argument('-rnn_layers', type=int, default=2)
-parser.add_argument('-mem_size', type=int, default=10)
+parser.add_argument('-mem_size', type=int, default=40)
 parser.add_argument('-mem_layers', type=int, default=2)
 parser.add_argument('-review_encoder_dropout', type=float, default=0.1)
 parser.add_argument('-sum_encoder_dropout', type=float, default=0.1)
@@ -45,11 +45,11 @@ parser.add_argument('-loss_type', type=str, default='text')
 parser.add_argument('-mem_loss_temp', type=float, default=10)
 parser.add_argument('-mem_loss_ratio', type=float, default=1)
 parser.add_argument('-max_norm', type=float, default=5.0)
-parser.add_argument('-batch_size', type=int, default=32)
+parser.add_argument('-batch_size', type=int, default=5)
 parser.add_argument('-epochs', type=int, default=10)
 parser.add_argument('-seed', type=int, default=2333)
 parser.add_argument('-print_every', type=int, default=10)
-parser.add_argument('-valid_every', type=int, default=3000)
+parser.add_argument('-valid_every', type=int, default=10000)
 parser.add_argument('-test', action='store_true')
 parser.add_argument('-use_cuda', type=bool, default=False)
 
@@ -82,9 +82,12 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
     loss, r1, r2, rl = .0, .0, .0, .0
     rouge = RougeCalculator(stopwords=False, lang="en")
     for batch in tqdm(data_iter):
-        src, trg, src_embed, trg_embed, mem_up, mem_review, mem_sum, mem_gold, src_text, trg_text = vocab.make_tensors(batch, train_data)
-        mem_out, sum_out = net(src, trg, src_embed, trg_embed, vocab.word_num, mem_up, mem_review, mem_sum, test=True)  # 预测时无target
-        mem_out_1, sum_out_1 = net(src, trg, src_embed, trg_embed, vocab.word_num, mem_up, mem_review, mem_sum, test=False)  # 计算loss的时候有target
+        src, trg, src_embed, trg_embed, mem_up, mem_review, mem_sum, mem_gold, src_text, trg_text = vocab.make_tensors(
+            batch, train_data)
+        mem_out, sum_out = net(src, trg, src_embed, trg_embed, vocab.word_num, mem_up, mem_review, mem_sum,
+                               test=True)  # 预测时无target
+        mem_out_1, sum_out_1 = net(src, trg, src_embed, trg_embed, vocab.word_num, mem_up, mem_review, mem_sum,
+                                   test=False)  # 计算loss的时候有target
 
         mem_out_1 = mem_out_1.view(-1, mem_out_1.size(-1))
         sum_out_1 = torch.log(sum_out_1.view(-1, sum_out_1.size(-1)) + 1e-20)
@@ -110,6 +113,7 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
             r1 += rouge.rouge_n(cur_sum, trg_text[i], n=1)
             r2 += rouge.rouge_n(cur_sum, trg_text[i], n=2)
             rl += rouge.rouge_l(cur_sum, trg_text[i])
+        torch.cuda.empty_cache()
     for i in example_idx:
         print('> %s' % reviews[i])
         print('= %s' % refs[i])
@@ -188,7 +192,8 @@ def train():
         for i, batch in enumerate(train_iter):
             if epoch > args.lr_decay_start:
                 adjust_learning_rate(optim, epoch - args.lr_decay_begin)
-            src, trg, src_embed, trg_embed, mem_up, mem_review, mem_sum, mem_gold, _1, _2 = vocab.make_tensors(batch, train_data)
+            src, trg, src_embed, trg_embed, mem_up, mem_review, mem_sum, mem_gold, _1, _2 = vocab.make_tensors(batch,
+                                                                                                               train_data)
             mem_output, sum_output = net(src, trg, src_embed, trg_embed, vocab.word_num, mem_up, mem_review, mem_sum)
             mem_output = mem_output.view(-1, mem_output.size(-1))
             sum_output = torch.log(sum_output.view(-1, sum_output.size(-1)) + 1e-20)
@@ -200,12 +205,13 @@ def train():
             clip_grad_norm_(net.parameters(), args.max_norm)
             optim.step()
             optim.zero_grad()
+            torch.cuda.empty_cache()
 
             cnt = (epoch - 1) * len(train_iter) + i
             if cnt % args.print_every == 0:
                 print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f sum_loss=%f mem_loss=%f' % (
                     epoch, args.epochs, i, len(train_iter), loss.data, sum_loss.data, mem_loss.data))
-            """
+
             if cnt % args.valid_every == 0 and cnt / args.valid_every >= 0:
                 print('Begin valid... Epoch %d, Batch %d' % (epoch, i))
                 cur_loss, r1, r2, rl = evaluate(net, criterion, vocab, val_iter, train_data, True)
@@ -214,7 +220,6 @@ def train():
                 net.save(save_path)
                 print('Epoch: %2d Val_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' %
                       (epoch, cur_loss, r1, r2, rl))
-            """
     return
 
 

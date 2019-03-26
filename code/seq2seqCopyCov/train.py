@@ -1,6 +1,6 @@
 # coding: utf-8
 
-# Use seq2seq + Luong attention + copy mechanism + user/product attributes to generate amazon review summaries.
+# Use seq2seq + Luong attention + copy mechanism + coverage mechanism to generate amazon review summaries.
 # Ref: https://bastings.github.io/annotated_encoder_decoder/
 
 import os
@@ -10,31 +10,28 @@ import random
 import numpy as np
 from tqdm import tqdm
 import torch
-import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
-from vocab import Vocab, Dataset
-from models import EncoderDecoder
+from vocab import Vocab
+from dataset import Dataset
+from models import EncoderDecoder, MyLoss
 from sumeval.metrics.rouge import RougeCalculator
 
-parser = argparse.ArgumentParser(description='seq2seqAttrBase2')
+parser = argparse.ArgumentParser(description='seq2seqCopyCov')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints1/')
-parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
+parser.add_argument('-save_path', type=str, default='checkpoints3/')
+parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.review.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/aligned/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/aligned/valid/')
 parser.add_argument('-test_dir', type=str, default='../../data/aligned/test/')
 parser.add_argument('-load_model', type=str, default=None)
-parser.add_argument('-begin_epoch', type=int, default=1)
 parser.add_argument('-output_dir', type=str, default='output/')
 parser.add_argument('-example_num', type=int, default=4)
 # hyper paras
 parser.add_argument('-embed_dim', type=int, default=300)
 parser.add_argument('-embed_num', type=int, default=0)
 parser.add_argument('-word_min_cnt', type=int, default=20)
-parser.add_argument('-attr_dim', type=int, default=300)
-parser.add_argument('-user_num', type=int, default=0)
-parser.add_argument('-product_num', type=int, default=0)
+parser.add_argument('-review_max_len', type=int, default=250)
 parser.add_argument('-sum_max_len', type=int, default=15)
 parser.add_argument('-hidden_size', type=int, default=512)
 parser.add_argument('-num_layers', type=int, default=2)
@@ -43,11 +40,15 @@ parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay', type=float, default=0.5)
 parser.add_argument('-max_norm', type=float, default=5.0)
-parser.add_argument('-batch_size', type=int, default=64)
+parser.add_argument('-batch_size', type=int, default=32)
 parser.add_argument('-epochs', type=int, default=10)
+parser.add_argument('-begin_epoch', type=int, default=1)
+parser.add_argument('-cov_begin_epoch', type=int, default=11)
+parser.add_argument('-cov_lambda', type=float, default=1)
+parser.add_argument('-beam_size', type=int, default=1)
 parser.add_argument('-seed', type=int, default=2333)
 parser.add_argument('-print_every', type=int, default=10)
-parser.add_argument('-valid_every', type=int, default=1000)
+parser.add_argument('-valid_every', type=int, default=1500)
 parser.add_argument('-test', action='store_true')
 parser.add_argument('-use_cuda', type=bool, default=False)
 
@@ -77,18 +78,18 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
     rouge = RougeCalculator(stopwords=False, lang="en")
     with torch.no_grad():
         for batch in tqdm(data_iter):
-            src, trg, src_embed, trg_embed, src_user, src_product, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.read_batch(
-                batch)
-            pre_output1 = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, src_mask, src_lens,
-                              trg_lens, test=False)
-            pre_output = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, src_mask, src_lens,
-                             trg_lens, test=True)
+            src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.read_batch(batch)
+            pre_output1, a, c = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens)
+            pre_output, _, _ = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens, test=True)
             output = torch.log(pre_output1.view(-1, pre_output1.size(-1)) + 1e-20)
             trg_output = trg.view(-1)
-            loss += criterion(output, trg_output).data.item() / len(src_lens)
+            if a is not None and c is not None:
+                a = a.view(-1, a.size(-1))
+                c = c.view(-1, c.size(-1))
+            loss += criterion(output, trg_output, a, c, len(src_lens))[1].data.item()
             reviews.extend(src_text)
             refs.extend(trg_text)
-            # pre_output[:, :, 3] = float('-inf')
+            pre_output[:, :, 3] = float('-inf')
             rst = torch.argmax(pre_output, dim=-1).tolist()
             for i, summary in enumerate(rst):
                 cur_sum = ['']
@@ -145,8 +146,6 @@ def train():
         f.close()
         vocab.add_sentence(train_data[-1]['reviewText'].split())
         vocab.add_sentence(train_data[-1]['summary'].split())
-        vocab.add_user(train_data[-1]['userID'])
-        vocab.add_product(train_data[-1]['productID'])
     fns = os.listdir(args.valid_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -155,8 +154,6 @@ def train():
         f.close()
         vocab.add_sentence(val_data[-1]['reviewText'].split())
         vocab.add_sentence(val_data[-1]['summary'].split())
-        vocab.add_user(val_data[-1]['userID'])
-        vocab.add_product(val_data[-1]['productID'])
     fns = os.listdir(args.test_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -165,17 +162,11 @@ def train():
         f.close()
         vocab.add_sentence(test_data[-1]['reviewText'].split())
         vocab.add_sentence(test_data[-1]['summary'].split())
-        vocab.add_user(test_data[-1]['userID'])
-        vocab.add_product(test_data[-1]['productID'])
 
     print('Deleting rare words...')
     embed = vocab.trim()
-    # save_embed(vocab, '../../embedding/glove/glove.unaligned.txt')
-
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
-    args.user_num = vocab.user_num
-    args.product_num = vocab.product_num
 
     train_dataset = Dataset(train_data)
     val_dataset = Dataset(val_data)
@@ -190,19 +181,21 @@ def train():
         net.load_state_dict(checkpoint['model'])
     if args.use_cuda:
         net.cuda()
-    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, size_average=False)
+    criterion = MyLoss(args)
     optim = torch.optim.Adam(net.parameters(), lr=args.lr)
-
     print('Begin training...')
     for epoch in range(args.begin_epoch, args.epochs + 1):
+        if epoch == args.cov_begin_epoch:
+            net.coverage = True
         for i, batch in enumerate(train_iter):
-            src, trg, src_embed, trg_embed, src_user, src_product, src_mask, src_lens, trg_lens, _1, _2 = vocab.read_batch(
-                batch)
-            pre_output = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, src_mask,
-                             src_lens, trg_lens)
+            src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, _1, _2 = vocab.read_batch(batch)
+            pre_output, a, c = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens)
             pre_output = torch.log(pre_output.view(-1, pre_output.size(-1)) + 1e-20)
             trg_output = trg.view(-1)
-            loss = criterion(pre_output, trg_output) / len(src_lens)
+            if a is not None and c is not None:
+                a = a.view(-1, a.size(-1))
+                c = c.view(-1, c.size(-1))
+            loss, loss_nll, loss_cov = criterion(pre_output, trg_output, a, c, len(src_lens))
             loss.backward()
             clip_grad_norm_(net.parameters(), args.max_norm)
             optim.step()
@@ -210,7 +203,8 @@ def train():
 
             cnt = (epoch - 1) * len(train_iter) + i
             if cnt % args.print_every == 0:
-                print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f' % (epoch, args.epochs, i, len(train_iter), loss.data))
+                print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f loss_nll=%f loss_cov=%f' % (
+                    epoch, args.epochs, i, len(train_iter), loss.data, loss_nll.data, loss_cov.data))
 
             if cnt % args.valid_every == 0:
                 print('Begin valid... Epoch %d, Batch %d' % (epoch, i))
@@ -246,8 +240,6 @@ def test():
         f.close()
         vocab.add_sentence(train_data[-1]['reviewText'].split())
         vocab.add_sentence(train_data[-1]['summary'].split())
-        vocab.add_user(train_data[-1]['userID'])
-        vocab.add_product(train_data[-1]['productID'])
     fns = os.listdir(args.valid_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -256,8 +248,6 @@ def test():
         f.close()
         vocab.add_sentence(val_data[-1]['reviewText'].split())
         vocab.add_sentence(val_data[-1]['summary'].split())
-        vocab.add_user(val_data[-1]['userID'])
-        vocab.add_product(val_data[-1]['productID'])
     fns = os.listdir(args.test_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
@@ -266,15 +256,11 @@ def test():
         f.close()
         vocab.add_sentence(test_data[-1]['reviewText'].split())
         vocab.add_sentence(test_data[-1]['summary'].split())
-        vocab.add_user(test_data[-1]['userID'])
-        vocab.add_product(test_data[-1]['productID'])
     embed = vocab.trim()
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
-    args.user_num = vocab.user_num
-    args.product_num = vocab.product_num
     test_dataset = Dataset(test_data)
-    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False)
+    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
 
     print('Loading model...')
     checkpoint = torch.load(args.save_path + args.load_model)
@@ -282,7 +268,7 @@ def test():
     net.load_state_dict(checkpoint['model'])
     if args.use_cuda:
         net.cuda()
-    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, size_average=False)
+    criterion = MyLoss(args)
 
     print('Begin testing...')
     loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, False)

@@ -121,7 +121,7 @@ class Vocab:
                     self.word_num += 1
 
         # 生成神经网络所需要的input tensors
-        src_max_len = len(src_text[0].split())
+        src_max_len = min(self.args.review_max_len, len(src_text[0].split()))
         trg_max_len = self.args.sum_max_len
         src, trg = [], []
         src_embed, trg_embed = [], []
@@ -162,8 +162,8 @@ class Vocab:
                 cur_idx = [i if i < self.fixed_num else self.UNK_IDX for i in cur_idx]
                 u_sum.append(cur_idx)
             for _ in range(len(mem_user), self.args.mem_size):  # 不足补全
-                u_review.append([self.PAD_IDX] * review_max_len)
-                u_sum.append([self.PAD_IDX] * sum_max_len)
+                u_review.append([self.EOS_IDX] + [self.PAD_IDX] * (review_max_len - 1))
+                u_sum.append([self.EOS_IDX] + [self.PAD_IDX] * (sum_max_len - 1))
             for mem_piece in mem_product:
                 mem_data = train_data[mem_piece[0]]
                 assert mem_data['productID'] == cur_product
@@ -178,8 +178,8 @@ class Vocab:
                 cur_idx = [i if i < self.fixed_num else self.UNK_IDX for i in cur_idx]
                 p_sum.append(cur_idx)
             for _ in range(len(mem_product), self.args.mem_size):  # 不足补全
-                p_review.append([self.PAD_IDX] * review_max_len)
-                p_sum.append([self.PAD_IDX] * sum_max_len)
+                p_review.append([self.EOS_IDX] + [self.PAD_IDX] * (review_max_len - 1))
+                p_sum.append([self.EOS_IDX] + [self.PAD_IDX] * (sum_max_len - 1))
 
         src, trg = torch.LongTensor(src), torch.LongTensor(trg)
         src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)

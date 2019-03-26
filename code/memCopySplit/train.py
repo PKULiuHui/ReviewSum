@@ -1,6 +1,6 @@
 # coding: utf-8
 
-# Use memory network + seq2seqAttn to generate review summaries.
+# Use memory network + seq2seqCopy to generate review summaries.
 
 import os
 import json
@@ -18,7 +18,7 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='memCopySplit')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints2/')
+parser.add_argument('-save_path', type=str, default='checkpoints1/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/aligned_memory/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/aligned_memory/valid/')
@@ -32,7 +32,7 @@ parser.add_argument('-embed_num', type=int, default=0)
 parser.add_argument('-word_min_cnt', type=int, default=20)
 parser.add_argument('-review_max_len', type=int, default=200)
 parser.add_argument('-sum_max_len', type=int, default=15)
-parser.add_argument('-hidden_size', type=int, default=512)
+parser.add_argument('-hidden_size', type=int, default=400)
 parser.add_argument('-rnn_layers', type=int, default=2)
 parser.add_argument('-mem_size', type=int, default=10)
 parser.add_argument('-mem_layers', type=int, default=2)
@@ -105,6 +105,7 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
             r1 += rouge.rouge_n(cur_sum, trg_text[i], n=1)
             r2 += rouge.rouge_n(cur_sum, trg_text[i], n=2)
             rl += rouge.rouge_l(cur_sum, trg_text[i])
+        # torch.cuda.empty_cache()
     for i in example_idx:
         print('> %s' % reviews[i])
         print('= %s' % refs[i])
@@ -140,6 +141,8 @@ def train():
     fns = os.listdir(args.train_dir)
     fns.sort(key=lambda p: int(p.split('.')[0]))
     for fn in tqdm(fns):
+        a = np.random.choice(range(1000), 500)
+        a.sort()
         f = open(args.train_dir + fn, 'r')
         train_data.append(json.load(f))
         f.close()
@@ -192,6 +195,7 @@ def train():
             clip_grad_norm_(net.parameters(), args.max_norm)
             optim.step()
             optim.zero_grad()
+            # torch.cuda.empty_cache()
 
             cnt = (epoch - 1) * len(train_iter) + i
             if cnt % args.print_every == 0:
@@ -250,7 +254,7 @@ def test():
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
     test_dataset = Dataset(val_data)
-    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
+    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=my_collate)
 
     print('Loading model...')
     checkpoint = torch.load(args.save_path + args.load_model)

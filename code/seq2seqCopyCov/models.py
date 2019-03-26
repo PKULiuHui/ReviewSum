@@ -5,33 +5,29 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
-class MemCopy(nn.Module):
+class EncoderDecoder(nn.Module):
 
     def __init__(self, args, embed):
-        super(MemCopy, self).__init__()
-        self.name = 'seq2seqAttnCopy + memory'
+        super(EncoderDecoder, self).__init__()
+        self.name = 'seq2seqCopyCov'
         self.args = args
-        # Embedding layer, shared by all encoders and decoder
+        self.coverage = False
+        # Embedding layer
         self.embed = nn.Embedding(args.embed_num, args.embed_dim)
         if embed is not None:
             self.embed.weight.data.copy_(embed)
-        # Review Encoder
-        self.review_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.rnn_layers, batch_first=True,
-                                     bidirectional=True, dropout=args.review_encoder_dropout)
-        # Summary Encoder
-        self.sum_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.rnn_layers, batch_first=True,
-                                  bidirectional=True, dropout=args.sum_encoder_dropout)
-        # Memory Scoring layer
-        self.review_sim_1 = nn.Linear(2 * args.hidden_size, 1)
-        self.review_sim_2 = nn.Linear(2 * args.hidden_size, 1)
-        self.key_score = nn.Linear(3, 1)  # [u : p : ri·rj] => similarity_score
-        self.new_query = nn.Linear(4 * args.hidden_size, 2 * args.hidden_size)  # [query : mem_out] => new_query
+        # Encoder
+        self.encoder_rnn = nn.GRU(args.embed_dim, args.hidden_size, args.num_layers,
+                                  batch_first=True, bidirectional=True, dropout=args.encoder_dropout)
         # Attention
         self.attention = Attention(args.hidden_size)
         # Decoder
-        self.decoder_rnn = nn.GRU(args.embed_dim + args.hidden_size + 2 * args.hidden_size, args.hidden_size,
-                                  args.rnn_layers, batch_first=True, dropout=args.decoder_dropout)
+        self.decoder_rnn = nn.GRU(args.embed_dim + args.hidden_size, args.hidden_size, args.num_layers,
+                                  batch_first=True, dropout=args.decoder_dropout)
+        # init decoder hidden from encoder final hidden
         self.init_hidden = nn.Linear(2 * args.hidden_size, args.hidden_size)
+        self.dropout_layer = nn.Dropout(p=args.decoder_dropout)
+        # mix hidden and context into a context_hidden vector
         self.context_hidden = nn.Linear(3 * args.hidden_size, args.hidden_size, bias=False)
         # generate mode probability layer
         self.gen_p = nn.Linear(3 * args.hidden_size + args.embed_dim, 1)
@@ -39,21 +35,27 @@ class MemCopy(nn.Module):
         self.generator = nn.Linear(args.hidden_size, args.embed_num, bias=False)
         # copy mode layer, no learnable paras, attn_scores => word distribution over src vocab, P(other vocab) = 0
 
-    def decode_step(self, src, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden, mem_out,
-                    vocab_size):
+    def decode_step(self, src, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden, vocab_size, c):
         """Perform a single decoder step (1 word)"""
 
         # update rnn hidden state
-        rnn_input = torch.cat([prev_embed, context_hidden, mem_out], dim=2)
+        rnn_input = torch.cat([prev_embed, context_hidden], dim=2)
         output, hidden = self.decoder_rnn(rnn_input, hidden)
 
         # compute context vector using attention mechanism
         query = hidden[-1].unsqueeze(1)  # [B, 1, H]
-        context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
+        if self.coverage:
+            proj_cov = self.attention.cov_layer(c.squeeze(1).unsqueeze(-1))
+            context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask,
+                                                 proj_cov=proj_cov)
+        else:
+            context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
 
+        c = c + attn_probs
         # 计算generate mode下的word distribution，非固定词表部分概率为0
         context_hidden = F.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
-        gen_prob = F.softmax(self.generator(context_hidden), dim=-1)
+        context_hidden_1 = self.dropout_layer(context_hidden)
+        gen_prob = F.softmax(self.generator(context_hidden_1), dim=-1)
         if vocab_size > gen_prob.size(2):
             gen_prob = torch.cat(
                 [gen_prob, torch.zeros(gen_prob.size(0), gen_prob.size(1), vocab_size - gen_prob.size(2)).cuda()],
@@ -66,60 +68,23 @@ class MemCopy(nn.Module):
         # 计算generate的概率p
         gen_p = F.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
         mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
-        return hidden, context_hidden, mix_prob
+        return hidden, context_hidden, mix_prob, c, attn_probs
 
-    def forward(self, src, trg, src_, trg_, vocab_size, mem_up, mem_review, mem_sum, test=False):
-        # useful variables
-        batch_size = len(src)
-        mem_size = self.args.mem_size
-        src_lens = torch.sum(torch.sign(src), dim=1).tolist()
-        src_mask = torch.sign(src).data
-        mem_review_lens = torch.sum(torch.sign(mem_review), dim=1)
-        mem_sum_lens = torch.sum(torch.sign(mem_sum), dim=1)
-        mem_up = mem_up.view(batch_size, mem_size, 2)
-
-        # sort mem_review and mem_sum according to text lens, save idxs
-        mem_review_lens, mem_review_idx = torch.sort(mem_review_lens, descending=True)
-        mem_review = torch.index_select(mem_review, 0, mem_review_idx)
-        mem_sum_lens, mem_sum_idx = torch.sort(mem_sum_lens, descending=True)
-        mem_sum = torch.index_select(mem_sum, 0, mem_sum_idx)
-
-        # embed text(src, mem_review, mem_sum)
+    # src_和src的区别在于对于不在固定词典中的词，src中序号为它在可变词典中的序号，src_中的序号为UNK_IDX，
+    # 这样设置是为了方便embedding层，否则还要挨个判断每个词是否在固定词典中
+    def forward(self, src, trg, src_, trg_, vocab_size, src_mask, src_lengths, trg_lengths, test=False):
+        # embed input
         src_embed = self.embed(src_)  # x: [B, S, D]
-        mem_review_embed = self.embed(mem_review)
-        mem_sum_embed = self.embed(mem_sum)
 
-        # feed text into encoders
-        packed = pack_padded_sequence(src_embed, src_lens, batch_first=True)
-        encoder_hidden, encoder_final = self.review_encoder(packed)
+        # feed input to encoder RNN
+        packed = pack_padded_sequence(src_embed, src_lengths, batch_first=True)
+        encoder_hidden, encoder_final = self.encoder_rnn(packed)
         encoder_hidden, _ = pad_packed_sequence(encoder_hidden, batch_first=True)  # encoder_hidden: [B, S, 2H]
+
+        # get encoder final state, will be used as decoder initial state
         fwd_final = encoder_final[0:encoder_final.size(0):2]
         bwd_final = encoder_final[1:encoder_final.size(0):2]
         encoder_final = torch.cat([fwd_final, bwd_final], dim=2)  # encoder_final: [num_layers, B, 2H]
-
-        review_packed = pack_padded_sequence(mem_review_embed, mem_review_lens, batch_first=True)
-        _, review_final = self.review_encoder(review_packed)
-        review_final = \
-            torch.cat([review_final[0:review_final.size(0):2], review_final[1:review_final.size(0):2]], dim=2)[-1]
-        _, idx2 = torch.sort(mem_review_idx)
-        review_final = torch.index_select(review_final, 0, idx2)
-
-        sum_packed = pack_padded_sequence(mem_sum_embed, mem_sum_lens, batch_first=True)
-        _, sum_final = self.sum_encoder(sum_packed)
-        sum_final = torch.cat([sum_final[0:sum_final.size(0):2], sum_final[1:sum_final.size(0):2]], dim=2)[-1]
-        _, idx2 = torch.sort(mem_sum_idx)
-        sum_final = torch.index_select(sum_final, 0, idx2)
-
-        query = encoder_final[-1]
-        for i in range(self.args.mem_layers):
-            review_sim_1 = self.review_sim_1(query).unsqueeze(1)
-            review_sim_2 = self.review_sim_2(review_final.view(batch_size, mem_size, -1))
-            review_sim = review_sim_1 + review_sim_2
-            key_score = F.softmax(self.key_score(torch.cat([mem_up, review_sim], dim=-1)).view(batch_size, mem_size),
-                                  dim=-1)
-            mem_out = torch.bmm(key_score.view(batch_size, 1, mem_size), sum_final.view(batch_size, mem_size, -1)).view(
-                batch_size, -1)
-            query = self.new_query(torch.cat([query, mem_out], dim=-1))
 
         trg_embed = self.embed(trg_)
         max_len = self.args.sum_max_len
@@ -130,6 +95,12 @@ class MemCopy(nn.Module):
         # this is only done for efficiency
         proj_key = self.attention.key_layer(encoder_hidden)
         pre_output_vectors = []
+        output_a = None
+        output_c = None
+        c = torch.zeros(src.size(0), 1, src.size(1)).cuda()
+        if self.coverage:
+            output_c = [c]
+            output_a = []
 
         # unroll the decoder RNN for max_len steps
         for i in range(max_len):
@@ -144,13 +115,17 @@ class MemCopy(nn.Module):
                         if prev_idx[j][0] >= self.args.embed_num:
                             prev_idx[j][0] = 3  # UNK_IDX
                     prev_embed = self.embed(prev_idx)
-            hidden, context_hidden, word_prob = self.decode_step(src, prev_embed, encoder_hidden, src_mask, proj_key,
-                                                                 hidden, context_hidden, mem_out.unsqueeze(1),
-                                                                 vocab_size)
+            hidden, context_hidden, word_prob, c, a = self.decode_step(src, prev_embed, encoder_hidden, src_mask,
+                                                                       proj_key, hidden, context_hidden, vocab_size, c)
             pre_output_vectors.append(word_prob)
+            if self.coverage:
+                output_a.append(a)
+                output_c.append(c)
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
-
-        return key_score, pre_output_vectors
+        if self.coverage:
+            output_a = torch.cat(output_a, dim=1)
+            output_c = torch.cat(output_c[:-1], dim=1)
+        return pre_output_vectors, output_a, output_c
 
     def save(self, dir):
         checkpoint = {'model': self.state_dict(), 'args': self.args}
@@ -168,12 +143,13 @@ class Attention(nn.Module):
         # additive attention components, score(hi, hj) = v * tanh(W1 * hi + W2 + hj)
         self.key_layer = nn.Linear(key_size, hidden_size, bias=False)
         self.query_layer = nn.Linear(query_size, hidden_size, bias=False)
+        self.cov_layer = nn.Linear(1, hidden_size, bias=False)
         self.energy_layer = nn.Linear(hidden_size, 1, bias=False)
 
         # to store attention scores
         self.alphas = None
 
-    def forward(self, query=None, proj_key=None, value=None, mask=None):
+    def forward(self, query=None, proj_key=None, value=None, mask=None, proj_cov=None):
         assert mask is not None, "mask is required"
 
         # We first project the query (the decoder state).
@@ -181,7 +157,10 @@ class Attention(nn.Module):
         query = self.query_layer(query)
 
         # Calculate scores.
-        scores = self.energy_layer(torch.tanh(query + proj_key))
+        if proj_cov is None:
+            scores = self.energy_layer(torch.tanh(query + proj_key))
+        else:
+            scores = self.energy_layer(torch.tanh(query + proj_key + proj_cov))
         scores = scores.squeeze(2).unsqueeze(1)
 
         # Mask out invalid positions.
@@ -203,18 +182,12 @@ class Attention(nn.Module):
 class MyLoss(nn.Module):
     def __init__(self, args):
         super(MyLoss, self).__init__()
-        assert args.loss_type == 'text' or args.loss_type == 'mix'
-        self.type = args.loss_type
-        self.temp = args.mem_loss_temp
-        self.ratio = args.mem_loss_ratio
+        self.nll = nn.NLLLoss(ignore_index=0, size_average=False)
+        self.lamb = args.cov_lambda
 
-    def forward(self, mem_output, sum_output, mem_output_gold, sum_output_gold):
-        nll_loss = nn.NLLLoss(ignore_index=0, size_average=False)
-        loss_1 = nll_loss(sum_output, sum_output_gold)
-        if self.type == 'text':
-            return loss_1, loss_1, loss_1
-        mem_output_gold = F.softmax(mem_output_gold * self.temp, dim=-1)
-        kl_div_loss = nn.KLDivLoss(size_average=False)
-        loss_2 = self.ratio * kl_div_loss(torch.log(mem_output + 1e-20), mem_output_gold)
-        loss = loss_1 + loss_2
-        return loss, loss_1, loss_2
+    def forward(self, output, target, a, c, l):
+        nll_loss = self.nll(output, target) / l
+        cov_loss = torch.FloatTensor([0]).cuda().squeeze(0)
+        if a is not None and c is not None:
+            cov_loss = torch.sum(torch.min(a, c)) / l
+        return nll_loss + self.lamb * cov_loss, nll_loss, cov_loss

@@ -19,7 +19,7 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='seq2seqAttrBase')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints2/')
+parser.add_argument('-save_path', type=str, default='checkpoints1/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/aligned/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/aligned/valid/')
@@ -255,7 +255,7 @@ def test():
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
     test_dataset = Dataset(test_data)
-    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
+    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False)
 
     print('Loading model...')
     checkpoint = torch.load(args.save_path + args.load_model)
