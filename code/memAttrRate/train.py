@@ -1,13 +1,13 @@
 # coding: utf-8
 
-# Use memory network(split) + seq2seqCopyAttr to generate review summaries.
-# 结构上更加完整、一致，可以使用gate_model，也可以使用linear_model，后续也可扩展
-# 每个模型下，可以选择使用或不使用highway(将user, product, mem_out feed给decode每一步)
+# Use memory network(split) + seq2seqAttr + rating prediction to generate review summaries.
+# Rating prediction使用简单的MLP预测分数
 
 import os
 import json
 import argparse
 import random
+import math
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -15,14 +15,14 @@ import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from vocab import Vocab, Dataset
-from gate_model import MemAttrGate
-from linear_model import MemAttrLinear
+# from model_basic import MemAttrRate
+# from model_upattn import MemAttrRate
+# from model_mem import MemAttrRate
+from model_memattn import MemAttrRate
 from sumeval.metrics.rouge import RougeCalculator
 
-parser = argparse.ArgumentParser(description='memAttr')
-parser.add_argument('-model', type=str, default='gate')
-parser.add_argument('-highway', type=bool, default=True)
-parser.add_argument('-save_path', type=str, default='checkpoints/')
+parser = argparse.ArgumentParser(description='memAttrRate')
+parser.add_argument('-save_path', type=str, default='checkpoints5/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/aligned_memory/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/aligned_memory/valid/')
@@ -37,6 +37,7 @@ parser.add_argument('-word_min_cnt', type=int, default=20)
 parser.add_argument('-attr_dim', type=int, default=300)
 parser.add_argument('-user_num', type=int, default=0)
 parser.add_argument('-product_num', type=int, default=0)
+parser.add_argument('-rating_num', type=int, default=4)
 parser.add_argument('-review_max_len', type=int, default=300)
 parser.add_argument('-sum_max_len', type=int, default=15)
 parser.add_argument('-hidden_size', type=int, default=512)
@@ -46,12 +47,13 @@ parser.add_argument('-mem_layers', type=int, default=2)
 parser.add_argument('-review_encoder_dropout', type=float, default=0.1)
 parser.add_argument('-sum_encoder_dropout', type=float, default=0.1)
 parser.add_argument('-decoder_dropout', type=float, default=0.1)
-parser.add_argument('-lr', type=float, default=1e-4)
+parser.add_argument('-lr', type=float, default=2e-4)
 parser.add_argument('-lr_decay_ratio', type=float, default=0.5)
 parser.add_argument('-lr_decay_start', type=int, default=6)
+parser.add_argument('-loss_ratio', type=float, default=1)
 parser.add_argument('-max_norm', type=float, default=5.0)
 parser.add_argument('-batch_size', type=int, default=16)
-parser.add_argument('-epochs', type=int, default=12)
+parser.add_argument('-epochs', type=int, default=10)
 parser.add_argument('-seed', type=int, default=2333)
 parser.add_argument('-print_every', type=int, default=10)
 parser.add_argument('-valid_every', type=int, default=3000)
@@ -85,22 +87,28 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
     reviews = []
     refs = []
     sums = []
-    loss, r1, r2, rl = .0, .0, .0, .0
+    ratings, pre_ratings = [], []
+    loss, r1, r2, rl, acc, mae = .0, .0, .0, .0, .0, .0
     rouge = RougeCalculator(stopwords=False, lang="en")
     for batch in tqdm(data_iter):
-        src, trg, src_embed, trg_embed, src_user, src_product, u_review, u_sum, p_review, p_sum, src_text, trg_text \
+        src, trg, src_, trg_, src_user, src_product, src_rating, u_review, u_sum, p_review, p_sum, src_text, trg_text \
             = vocab.make_tensors(batch, train_data)
-        sum_out = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, u_review, u_sum,
-                      p_review, p_sum, test=True)
-        sum_out_1 = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, u_review, u_sum,
-                        p_review, p_sum, test=False)
+        sum_out, rat_out = net(src, trg, src_, trg_, src_user, src_product, src_rating, vocab.word_num, u_review, u_sum,
+                               p_review, p_sum, test=True)
+        sum_out_1, rat_out_1 = net(src, trg, src_, trg_, src_user, src_product, src_rating, vocab.word_num, u_review,
+                                   u_sum, p_review, p_sum, test=False)
         sum_out_1 = torch.log(sum_out_1.view(-1, sum_out_1.size(-1)) + 1e-20)
         sum_out_gold = trg.view(-1)
-        loss += criterion(sum_out_1, sum_out_gold).data.item() / len(src)
+        rat_out_gold = src_rating.view(-1)
+        sum_loss = criterion(sum_out_1, sum_out_gold).data.item() / len(src)
+        rat_loss = criterion(rat_out_1, rat_out_gold).data.item() / len(src)
+        loss += sum_loss + args.loss_ratio * rat_loss
         reviews.extend(src_text)
         refs.extend(trg_text)
         sum_out[:, :, 3] = float('-inf')
         rst = torch.argmax(sum_out, dim=-1).tolist()
+        rst_rating = torch.argmax(rat_out, dim=-1).tolist()
+        rating = src_rating.tolist()
         for i, summary in enumerate(rst):
             cur_sum = ['']
             for idx in summary:
@@ -112,13 +120,18 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
             if len(cur_sum) == 0:
                 cur_sum = '<EMP>'
             sums.append(cur_sum)
+            ratings.append(rating[i])
+            pre_ratings.append(rst_rating[i])
+            if rating[i] == rst_rating[i]:
+                acc += 1.0
+            mae += math.fabs(rst_rating[i] - rating[i])
             r1 += rouge.rouge_n(cur_sum, trg_text[i], n=1)
             r2 += rouge.rouge_n(cur_sum, trg_text[i], n=2)
             rl += rouge.rouge_l(cur_sum, trg_text[i])
     for i in example_idx:
         print('> %s' % reviews[i])
-        print('= %s' % refs[i])
-        print('< %s\n' % sums[i])
+        print('= %d %s' % (ratings[i], refs[i]))
+        print('< %d %s\n' % (pre_ratings[i], sums[i]))
     if not train_next:  # 测试阶段将结果写入文件
         with open(args.output_dir + args.load_model, 'w') as f:
             for review, ref, summary in zip(reviews, refs, sums):
@@ -129,9 +142,11 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
     r1 /= len(sums)
     r2 /= len(sums)
     rl /= len(sums)
+    acc /= len(sums)
+    mae /= len(sums)
     if train_next:
         net.train()
-    return loss, r1, r2, rl
+    return loss, r1, r2, rl, acc, mae
 
 
 def train():
@@ -192,20 +207,13 @@ def train():
     train_iter = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=my_collate)
     val_iter = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=my_collate)
 
-    assert args.model == 'linear' or args.model == 'gate'
     if args.load_model is not None:
         print('Loading model...')
         checkpoint = torch.load(args.save_path + args.load_model)
-        if args.model == 'linear':
-            net = MemAttrLinear(checkpoint['args'], embed)
-        else:
-            net = MemAttrGate(checkpoint['args'], embed)
+        net = MemAttrRate(checkpoint['args'], embed)
         net.load_state_dict(checkpoint['model'])
     else:
-        if args.model == 'linear':
-            net = MemAttrLinear(args, embed)
-        else:
-            net = MemAttrGate(args, embed)
+        net = MemAttrRate(args, embed)
     if args.use_cuda:
         net.cuda()
     net.train()
@@ -217,13 +225,16 @@ def train():
         if epoch >= args.lr_decay_start:
             adjust_learning_rate(optim, epoch - args.lr_decay_start + 1)
         for i, batch in enumerate(train_iter):
-            src, trg, src_, trg_, src_user, src_product, u_review, u_sum, p_review, p_sum, _1, _2 = vocab.make_tensors(
-                batch, train_data)
-            sum_output = net(src, trg, src_, trg_, src_user, src_product, vocab.word_num, u_review, u_sum, p_review,
-                             p_sum)
+            src, trg, src_, trg_, src_user, src_product, src_rating, u_review, u_sum, p_review, p_sum, _1, _2 = \
+                vocab.make_tensors(batch, train_data)
+            sum_output, rat_output = net(src, trg, src_, trg_, src_user, src_product, src_rating, vocab.word_num,
+                                         u_review, u_sum, p_review, p_sum)
             sum_output = torch.log(sum_output.view(-1, sum_output.size(-1)) + 1e-20)
             sum_output_gold = trg.view(-1)
-            loss = criterion(sum_output, sum_output_gold) / len(src)
+            rat_output_gold = src_rating.view(-1)
+            sum_loss = criterion(sum_output, sum_output_gold) / len(src)
+            rat_loss = criterion(rat_output, rat_output_gold) / len(src)
+            loss = sum_loss + args.loss_ratio * rat_loss
             loss.backward()
             clip_grad_norm_(net.parameters(), args.max_norm)
             optim.step()
@@ -231,15 +242,16 @@ def train():
 
             cnt = (epoch - 1) * len(train_iter) + i
             if cnt % args.print_every == 0:
-                print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f' % (epoch, args.epochs, i, len(train_iter), loss.data))
+                print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] sum_loss = %f rat_loss = %f loss=%f' %
+                      (epoch, args.epochs, i, len(train_iter), sum_loss.data, rat_loss.data, loss.data))
             if cnt % args.valid_every == 0:
                 print('Begin valid... Epoch %d, Batch %d' % (epoch, i))
-                cur_loss, r1, r2, rl = evaluate(net, criterion, vocab, val_iter, train_data, True)
-                save_path = args.save_path + 'valid_%d_%.4f_%.4f_%.4f_%.4f' % (
-                    cnt / args.valid_every, cur_loss, r1, r2, rl)
+                cur_loss, r1, r2, rl, acc, mae = evaluate(net, criterion, vocab, val_iter, train_data, True)
+                save_path = args.save_path + 'valid_%d_%.4f_%.4f_%.4f_%.4f_%.4f_%.4f' % (
+                    cnt / args.valid_every, cur_loss, r1, r2, rl, acc, mae)
                 net.save(save_path)
-                print('Epoch: %2d Val_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' %
-                      (epoch, cur_loss, r1, r2, rl))
+                print('Epoch: %2d Val_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f Acc: %f Mae: %f' %
+                      (epoch, cur_loss, r1, r2, rl, acc, mae))
 
     return
 
@@ -300,20 +312,16 @@ def test():
     test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=my_collate)
 
     print('Loading model...')
-    assert args.model == 'linear' or args.model == 'gate'
     checkpoint = torch.load(args.save_path + args.load_model)
-    if args.model == 'linear':
-        net = MemAttrLinear(checkpoint['args'], embed)
-    else:
-        net = MemAttrGate(checkpoint['args'], embed)
+    net = MemAttrRate(checkpoint['args'], embed)
     net.load_state_dict(checkpoint['model'])
     if args.use_cuda:
         net.cuda()
     criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, size_average=False)
 
     print('Begin testing...')
-    loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, train_data, False)
-    print('Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' % (loss, r1, r2, rl))
+    loss, r1, r2, rl, acc, mae = evaluate(net, criterion, vocab, test_iter, train_data, False)
+    print('Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f Acc: %f Mae: %f' % (loss, r1, r2, rl, acc, mae))
 
 
 def test_all():
@@ -371,9 +379,9 @@ def test_all():
     test_dataset = Dataset(test_data)
     test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=my_collate)
 
-    start, end = 10, 33
+    start, end = 17, 33
     fns = os.listdir(args.save_path)
-    f = open('result', 'w')
+    f = open(args.save_path + 'result', 'w')
     for idx in range(start, end):
         fn = None
         for name in fns:
@@ -383,16 +391,14 @@ def test_all():
         if fn is None:
             continue
         checkpoint = torch.load(args.save_path + fn)
-        if args.model == 'linear':
-            net = MemAttrLinear(checkpoint['args'], embed)
-        else:
-            net = MemAttrGate(checkpoint['args'], embed)
+        net = MemAttrRate(checkpoint['args'], embed)
         net.load_state_dict(checkpoint['model'])
         if args.use_cuda:
             net.cuda()
         criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, size_average=False)
-        loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, train_data, True)
-        f.write('Idx: %d Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f\n' % (idx, loss, r1, r2, rl))
+        loss, r1, r2, rl, acc, mae = evaluate(net, criterion, vocab, test_iter, train_data, True)
+        f.write('Idx: %d Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f Acc: %f Mae: %f\n' % (
+            idx, loss, r1, r2, rl, acc, mae))
 
 
 if __name__ == '__main__':

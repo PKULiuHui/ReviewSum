@@ -1,6 +1,7 @@
 # coding=utf-8
 import torch
 import numpy as np
+import torch.utils.data as data
 
 
 # Vocab: 词典，由两部分组成
@@ -19,13 +20,21 @@ class Vocab:
         self.SOS_TOKEN = '<SOS>'
         self.EOS_TOKEN = '<EOS>'
         self.UNK_TOKEN = '<UNK>'
-        self.word_num = 4   # 词表总大小，包括固定部分和可变部分
+        self.word_num = 4  # 词表总大小，包括固定部分和可变部分
         self.fixed_num = 4  # 固定部分大小
         self.word2id = {self.PAD_TOKEN: self.PAD_IDX, self.SOS_TOKEN: self.SOS_IDX, self.EOS_TOKEN: self.EOS_IDX,
                         self.UNK_TOKEN: self.UNK_IDX}
         self.id2word = {v: k for k, v in self.word2id.items()}
         self.word2cnt = {self.PAD_TOKEN: 10000, self.SOS_TOKEN: 10000, self.EOS_TOKEN: 10000,
                          self.UNK_TOKEN: 10000}  # 给这几个标记较大的值防止后面被删去
+        self.user_num = 1
+        self.user2id = {'<UNK-USER>': 0}
+        self.id2user = {0: '<UNK-USER>'}
+        self.user2cnt = {'<UNK-USER>': 10000}
+        self.product_num = 1
+        self.product2id = {'<UNK-PRODUCT>': 0}
+        self.id2product = {0: '<UNK-PRODUCT>'}
+        self.product2cnt = {'<UNK-PRODUCT>': 10000}
         for i in range(4):
             self.embed.append(np.random.normal(size=args.embed_dim))
         if embed is not None:
@@ -51,7 +60,28 @@ class Vocab:
                 self.word2cnt[w] += 1
         self.fixed_num = self.word_num
 
-    # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量
+    # 读取一个用户，更新用户列表
+    def add_user(self, user):
+        if user not in self.user2id:
+            self.user2id[user] = self.user_num
+            self.id2user[self.user_num] = user
+            self.user2cnt[user] = 1
+            self.user_num += 1
+        else:
+            self.user2cnt[user] += 1
+
+    # 读取一个产品，更新产品列表
+    def add_product(self, product):
+        if product not in self.product2id:
+            self.product2id[product] = self.product_num
+            self.id2product[self.product_num] = product
+            self.product2cnt[product] = 1
+            self.product_num += 1
+        else:
+            self.product2cnt[product] += 1
+
+    # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量，
+    # 同时对user列表和product列表进行剪枝，只保留常见user和常见product
     def trim(self):
         print('original vocab size: %d' % len(self.word2cnt))
         reserved_words, reserved_idx = [], []
@@ -78,6 +108,37 @@ class Vocab:
         embed = torch.FloatTensor(embed)
         if self.args.use_cuda:
             embed = embed.cuda()
+
+        print('original user num = %d, product num = %d' % (self.user_num, self.product_num))
+        reserved_user, reserved_product = [], []
+        for i in range(self.user_num):
+            u = self.id2user[i]
+            if self.user2cnt[u] >= 10:
+                reserved_user.append(u)
+        cnt = 0
+        user2id, id2user, user2cnt = {}, {}, {}
+        for u in reserved_user:
+            user2id[u] = cnt
+            id2user[cnt] = u
+            user2cnt[u] = self.user2cnt[u]
+            cnt += 1
+        self.user_num = cnt
+        self.user2id, self.id2user, self.user2cnt = user2id, id2user, user2cnt
+
+        for i in range(self.product_num):
+            p = self.id2product[i]
+            if self.product2cnt[p] >= 10:
+                reserved_product.append(p)
+        cnt = 0
+        product2id, id2product, product2cnt = {}, {}, {}
+        for p in reserved_product:
+            product2id[p] = cnt
+            id2product[cnt] = p
+            product2cnt[p] = self.product2cnt[p]
+            cnt += 1
+        self.product_num = cnt
+        self.product2id, self.id2product, self.product2cnt = product2id, id2product, product2cnt
+        print('user num = %d, product num = %d' % (self.user_num, self.product_num))
         return embed
 
     def word_id(self, w):
@@ -121,35 +182,55 @@ class Vocab:
         # 生成神经网络所需要的input tensors
         src_max_len = min(self.args.review_max_len, len(src_text[0].split()))
         trg_max_len = self.args.sum_max_len
-        src, trg, src_mask, src_lens, trg_lens = [], [], [], [], []
+        src, trg = [], []
         src_embed, trg_embed = [], []  # 针对embed的src和trg输入，与src和trg相比，将处于可变词典的词序号替换成UNK_IDX
         for review in src_text:
             review = review.split()[:src_max_len]
-            cur_idx = []
-            for w in review:
-                cur_idx.append(self.word_id(w))
+            cur_idx = [self.word_id(w) for w in review]
             cur_idx.extend([self.PAD_IDX] * (src_max_len - len(review)))
             src.append(cur_idx)
             src_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
-            src_mask.append([1] * len(review) + [0] * (src_max_len - len(review)))
-            src_lens.append(len(review))
         for i, summary in enumerate(trg_text):
             summary = summary.split() + [self.EOS_TOKEN]
             summary = summary[:trg_max_len]
-            cur_idx = []
-            for w in summary:
-                cur_id = self.word_id(w)
-                if cur_id >= self.fixed_num and cur_id not in src[i]:
-                    cur_id = self.UNK_IDX
-                cur_idx.append(cur_id)
+            cur_idx = [self.word_id(w) for w in summary]
             cur_idx.extend([self.PAD_IDX] * (trg_max_len - len(summary)))
             trg.append(cur_idx)
             trg_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
-            trg_lens.append(len(summary))
-        src, trg, src_mask = torch.LongTensor(src), torch.LongTensor(trg), torch.LongTensor(src_mask)
-        src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)
-        if self.args.use_cuda:
-            src, trg, src_mask = src.cuda(), trg.cuda(), src_mask.cuda()
-            src_embed, trg_embed = src_embed.cuda(), trg_embed.cuda()
 
-        return src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text
+        src_user, src_product = [], []
+        for i in idx:
+            user = batch['userID'][i]
+            product = batch['productID'][i]
+            if user in self.user2id:
+                src_user.append(self.user2id[user])
+            else:
+                src_user.append(0)
+            if product in self.product2id:
+                src_product.append(self.product2id[product])
+            else:
+                src_product.append(0)
+
+        src, trg = torch.LongTensor(src), torch.LongTensor(trg)
+        src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)
+        src_user, src_product = torch.LongTensor(src_user), torch.LongTensor(src_product)
+        if self.args.use_cuda:
+            src, trg = src.cuda(), trg.cuda()
+            src_embed, trg_embed = src_embed.cuda(), trg_embed.cuda()
+            src_user, src_product = src_user.cuda(), src_product.cuda()
+
+        return src, trg, src_embed, trg_embed, src_user, src_product, src_text, trg_text
+
+
+class Dataset(data.Dataset):
+    def __init__(self, examples):
+        super(Dataset, self).__init__()
+        self.examples = examples
+        self.training = False
+
+    def __getitem__(self, idx):
+        ex = self.examples[idx]
+        return ex
+
+    def __len__(self):
+        return len(self.examples)

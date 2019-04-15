@@ -5,25 +5,23 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
-class MemAttrInit(nn.Module):
+class EncoderRating(nn.Module):
 
     def __init__(self, args, embed=None):
-        super(MemAttrInit, self).__init__()
-        self.name = 'seq2seqCopyAttr + user memory / product memory'
+        super(EncoderRating, self).__init__()
+        self.name = 'encoderRate + memory + user/product attention model'
         self.args = args
 
-        # Embedding layer, shared by all encoders and decoder
+        # Word embedding layer
         self.embed = nn.Embedding(args.embed_num, args.embed_dim)
         if embed is not None:
             self.embed.weight.data.copy_(embed)
-
-        # Review Encoder
-        self.review_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.rnn_layers, batch_first=True,
-                                     bidirectional=True, dropout=args.review_encoder_dropout)
+        # Text Encoder
+        self.review_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.num_layers, batch_first=True,
+                                     bidirectional=True, dropout=args.dropout)
         # Summary Encoder
-        self.sum_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.rnn_layers, batch_first=True,
-                                  bidirectional=True, dropout=args.sum_encoder_dropout)
-
+        self.sum_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.num_layers, batch_first=True,
+                                  bidirectional=True, dropout=args.dropout)
         # Memory Scoring layer
         self.review_sim_1 = nn.Linear(2 * args.hidden_size, 1)
         self.review_sim_2 = nn.Linear(2 * args.hidden_size, 1)
@@ -31,72 +29,18 @@ class MemAttrInit(nn.Module):
         # Memory fusion layer
         self.mem_fusion = nn.Linear(4 * args.hidden_size, 2 * args.hidden_size)  # [u_mem_out:p_mem_out] => mem_out
 
+        # Rating score prediction
+        self.u_attn = Attention(args.hidden_size, key_size=2 * args.hidden_size, query_size=args.attr_dim)
+        self.p_attn = Attention(args.hidden_size, key_size=2 * args.hidden_size, query_size=args.attr_dim)
+        self.rat_predict_1 = nn.Linear(6 * args.hidden_size + 2 * args.attr_dim, args.hidden_size)
+        self.rat_predict_2 = nn.Linear(args.hidden_size, args.rating_num)
+
         # User embedding layer
         self.user_embed = nn.Embedding(args.user_num, args.attr_dim)
         # Product embedding layer
         self.product_embed = nn.Embedding(args.product_num, args.attr_dim)
-        # Encoder final layer
-        self.encoder_final = nn.Linear(4 * args.hidden_size + 2 * args.attr_dim, args.hidden_size)
 
-        # Decoder
-        self.decoder_rnn = nn.GRU(args.embed_dim + args.hidden_size,
-                                  args.hidden_size, args.rnn_layers, batch_first=True, dropout=args.decoder_dropout)
-        # Text Attention
-        self.attention = Attention(args.hidden_size)
-        self.text_context = nn.Linear(2 * args.hidden_size, args.hidden_size)
-        # Attributes Attention
-        self.attention_attr = Attention(args.hidden_size, key_size=args.attr_dim, query_size=args.hidden_size)
-        self.attr_context = nn.Linear(args.attr_dim, args.hidden_size)
-        # context gate
-        self.context_gate = nn.Linear(3 * args.hidden_size + args.attr_dim + args.embed_dim, 1)
-
-        # mix hidden and context into a context_hidden vector
-        self.context_hidden = nn.Linear(2 * args.hidden_size, args.hidden_size)
-        # generate mode probability layer
-        self.gen_p = nn.Linear(2 * args.hidden_size + args.embed_dim, 1)
-        # Dropout layer before generator
-        self.dropout_layer = nn.Dropout(p=args.decoder_dropout)
-        # generate mode layer, context_hidden => word distribution over fixed vocab, P(changeable vocab) = 0
-        self.generator = nn.Linear(args.hidden_size, args.embed_num, bias=False)
-        # copy mode layer, no learnable paras, attn_scores => word distribution over src vocab, P(other vocab) = 0
-
-    def decode_step(self, src, prev_embed, encoder_hidden, src_mask, proj_key, encoder_attr,
-                    proj_key_attr, hidden, context_hidden, vocab_size):
-        """Perform a single decoder step (1 word)"""
-
-        # update rnn hidden state
-        rnn_input = torch.cat([prev_embed, context_hidden], dim=2)
-        output, hidden = self.decoder_rnn(rnn_input, hidden)
-
-        # compute context vector using attention mechanism
-        query = hidden[-1].unsqueeze(1)  # [B, 1, H]
-        context_text, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
-        context_attr, _ = self.attention_attr(query=query, proj_key=proj_key_attr, value=encoder_attr)
-
-        text_context = F.tanh(self.text_context(context_text))
-        attr_context = F.tanh(self.attr_context(context_attr))
-        context_g = F.sigmoid(self.context_gate(torch.cat([context_text, context_attr, query, prev_embed], dim=-1)))
-        context = context_g * text_context + (1 - context_g) * attr_context
-
-        # 计算generate mode下的word distribution，非固定词表部分概率为0
-        context_hidden = F.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
-        context_hidden = self.dropout_layer(context_hidden)
-        gen_prob = F.softmax(self.generator(context_hidden), dim=-1)
-        if vocab_size > gen_prob.size(2):
-            gen_prob = torch.cat(
-                [gen_prob, torch.zeros(gen_prob.size(0), gen_prob.size(1), vocab_size - gen_prob.size(2)).cuda()],
-                dim=-1)
-
-        # 计算copy mode下的word distribution，非src中的词概率为0
-        src = src.unsqueeze(1)
-        copy_prob = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_add(2, src, attn_probs)
-
-        # 计算generate的概率p
-        gen_p = F.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
-        mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
-        return hidden, context_hidden, mix_prob
-
-    def forward(self, src, trg, src_, trg_, user, product, vocab_size, u_review, u_sum, p_review, p_sum, test=False):
+    def forward(self, src, trg, src_, trg_, user, product, rating, vocab_size, u_review, u_sum, p_review, p_sum):
         # useful variables
         batch_size = len(src)
         mem_size = self.args.mem_size
@@ -130,7 +74,7 @@ class MemAttrInit(nn.Module):
         encoder_hidden, _ = pad_packed_sequence(encoder_hidden, batch_first=True)  # encoder_hidden: [B, S, 2H]
         fwd_final = encoder_final[0:encoder_final.size(0):2]
         bwd_final = encoder_final[1:encoder_final.size(0):2]
-        text_final = torch.cat([fwd_final, bwd_final], dim=2).transpose(0, 1)  # text_final: [B, num_layers, 2H]
+        encoder_final = torch.cat([fwd_final, bwd_final], dim=2).transpose(0, 1)  # encoder_final: [B, num_layers, 2H]
 
         packed = pack_padded_sequence(u_review, u_review_lens, batch_first=True)
         _, review_final = self.review_encoder(packed)
@@ -158,7 +102,7 @@ class MemAttrInit(nn.Module):
         _, idx2 = torch.sort(p_sum_idx)
         p_sum_final = torch.index_select(p_sum_final, 0, idx2)
 
-        u_query, p_query = text_final[:, -1], text_final[:, -1]
+        u_query, p_query = encoder_final[:, -1], encoder_final[:, -1]
         for i in range(self.args.mem_layers):
             review_sim_1 = self.review_sim_1(u_query).unsqueeze(1)
             review_sim_2 = self.review_sim_2(u_review_final.view(batch_size, mem_size, -1))
@@ -173,47 +117,20 @@ class MemAttrInit(nn.Module):
             p_mem_out = torch.bmm(key_score.view(batch_size, 1, mem_size),
                                   p_sum_final.view(batch_size, mem_size, -1)).view(batch_size, -1)
             p_query = self.new_query(torch.cat([p_query, p_mem_out], dim=-1))
-        mem_out = self.mem_fusion(torch.cat([u_mem_out, p_mem_out], dim=-1)).unsqueeze(1).repeat(1, text_final.size(1),
-                                                                                                 1)
+        mem_out = self.mem_fusion(torch.cat([u_mem_out, p_mem_out], dim=-1)).unsqueeze(1)  # mem_out: [B, 1, 2H]
 
         user_embed = self.user_embed(user)  # user_embed: [B, A]
         product_embed = self.product_embed(product)  # product_embed: [B, A]
-        attr_final = torch.cat([user_embed, product_embed], dim=-1).unsqueeze(1).repeat(1, text_final.size(1), 1)
-        encoder_attr = torch.cat([user_embed, product_embed], dim=-1).view(user_embed.size(0), 2, -1)
 
-        encoder_final = self.encoder_final(torch.cat([text_final, attr_final, mem_out], dim=-1))
-        encoder_final = encoder_final.view(len(src), self.args.rnn_layers, -1).transpose(0, 1)  # [num_layers, B, H]
-
-        trg_embed = self.embed(trg_)
-        max_len = self.args.sum_max_len
-        hidden = encoder_final.contiguous()
-        context_hidden = hidden[-1].unsqueeze(1)  # context_hidden指融合了context信息的hidden，初始化为hidden[-1]
-
-        # pre-compute projected encoder hidden states(the "keys" for the attention mechanism)
-        # this is only done for efficiency
-        proj_key = self.attention.key_layer(encoder_hidden)
-        proj_key_attr = self.attention_attr.key_layer(encoder_attr)
-        pre_output_vectors = []
-
-        # unroll the decoder RNN for max_len steps
-        for i in range(max_len):
-            if i == 0:  # <SOS> embedding
-                prev_embed = self.embed(torch.LongTensor([1]).cuda()).repeat(len(src), 1).unsqueeze(1)
-            else:
-                if not test:  # last trg word embedding
-                    prev_embed = trg_embed[:, i - 1].unsqueeze(1)
-                else:  # last predicted word embedding
-                    prev_idx = torch.argmax(pre_output_vectors[-1], dim=-1)
-                    for j in range(0, prev_idx.size(0)):
-                        if prev_idx[j][0] >= self.args.embed_num:
-                            prev_idx[j][0] = 3  # UNK_IDX
-                    prev_embed = self.embed(prev_idx)
-            hidden, context_hidden, word_prob = self.decode_step(src, prev_embed, encoder_hidden, src_mask,
-                                                                 proj_key, encoder_attr, proj_key_attr, hidden,
-                                                                 context_hidden, vocab_size)
-            pre_output_vectors.append(word_prob)
-        pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
-        return pre_output_vectors
+        # predict rating score
+        proj_key_u = self.u_attn.key_layer(encoder_hidden)
+        c1, _ = self.u_attn(query=user_embed.unsqueeze(1), proj_key=proj_key_u, value=encoder_hidden, mask=src_mask)
+        proj_key_p = self.p_attn.key_layer(encoder_hidden)
+        c2, _ = self.p_attn(query=product_embed.unsqueeze(1), proj_key=proj_key_p, value=encoder_hidden, mask=src_mask)
+        rat_input = torch.cat([user_embed, product_embed, c1.squeeze(1), c2.squeeze(1), mem_out.squeeze(1)], dim=-1)
+        rat_output = self.rat_predict_2(F.relu(self.rat_predict_1(rat_input)))
+        rat_output = F.log_softmax(rat_output, dim=-1)
+        return rat_output
 
     def save(self, dir):
         checkpoint = {'model': self.state_dict(), 'args': self.args}

@@ -198,10 +198,11 @@ class Vocab:
             trg.append(cur_idx)
             trg_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
 
-        src_user, src_product = [], []
+        src_user, src_product, src_rating = [], [], []
         for i in idx:
             user = batch['userID'][i]
             product = batch['productID'][i]
+            rating = batch['rating'][i]
             if user in self.user2id:
                 src_user.append(self.user2id[user])
             else:
@@ -210,6 +211,7 @@ class Vocab:
                 src_product.append(self.product2id[product])
             else:
                 src_product.append(0)
+            src_rating.append(int(rating))
 
         u_review, u_sum, p_review, p_sum = [], [], [], []
         review_max_len = self.args.review_max_len
@@ -255,16 +257,17 @@ class Vocab:
 
         src, trg = torch.LongTensor(src), torch.LongTensor(trg)
         src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)
-        src_user, src_product = torch.LongTensor(src_user), torch.LongTensor(src_product)
+        src_user, src_product, src_rating = torch.LongTensor(src_user), torch.LongTensor(src_product), torch.LongTensor(
+            src_rating)
         u_review, u_sum, p_review, p_sum = torch.LongTensor(u_review), torch.LongTensor(u_sum), torch.LongTensor(
             p_review), torch.LongTensor(p_sum)
         if self.args.use_cuda:
             src, trg = src.cuda(), trg.cuda()
             src_embed, trg_embed = src_embed.cuda(), trg_embed.cuda()
-            src_user, src_product = src_user.cuda(), src_product.cuda()
+            src_user, src_product, src_rating = src_user.cuda(), src_product.cuda(), src_rating.cuda()
             u_review, u_sum, p_review, p_sum = u_review.cuda(), u_sum.cuda(), p_review.cuda(), p_sum.cuda()
 
-        return src, trg, src_embed, trg_embed, src_user, src_product, u_review, u_sum, p_review, p_sum, src_text, trg_text
+        return src, trg, src_embed, trg_embed, src_user, src_product, src_rating, u_review, u_sum, p_review, p_sum, src_text, trg_text
 
 
 class Dataset(data.Dataset):

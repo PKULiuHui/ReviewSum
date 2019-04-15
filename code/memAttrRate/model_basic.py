@@ -5,13 +5,12 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
-class MemAttrGate(nn.Module):
+class MemAttrRate(nn.Module):
 
     def __init__(self, args, embed=None):
-        super(MemAttrGate, self).__init__()
-        self.name = 'Memory + Attributes + Gate Fusion'
+        super(MemAttrRate, self).__init__()
+        self.name = 'Memory + Attributes + Gate Fusion + MLP rating prediction'
         self.args = args
-        self.highway = args.highway
 
         # Embedding layer, shared by all encoders and decoder
         self.embed = nn.Embedding(args.embed_num, args.embed_dim)
@@ -22,6 +21,9 @@ class MemAttrGate(nn.Module):
         self.review_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.rnn_layers, batch_first=True,
                                      bidirectional=True, dropout=args.review_encoder_dropout)
         self.text_final = nn.Linear(2 * args.hidden_size, args.hidden_size)
+        # Rating score prediction
+        self.rat_predict_1 = nn.Linear(2 * args.hidden_size, args.hidden_size)
+        self.rat_predict_2 = nn.Linear(args.hidden_size, args.rating_num)
         # Summary Encoder
         self.sum_encoder = nn.GRU(args.embed_dim, args.hidden_size, args.rnn_layers, batch_first=True,
                                   bidirectional=True, dropout=args.sum_encoder_dropout)
@@ -38,18 +40,18 @@ class MemAttrGate(nn.Module):
         self.user_embed = nn.Embedding(args.user_num, args.attr_dim)
         # Product embedding layer
         self.product_embed = nn.Embedding(args.product_num, args.attr_dim)
+        # Rating embedding layer
+        self.rating_embed = nn.Embedding(args.rating_num, args.attr_dim)
         # Encoder final layer
-        self.attr_final = nn.Linear(2 * args.attr_dim, args.hidden_size)
+        self.attr_final = nn.Linear(3 * args.attr_dim, args.hidden_size)
 
         # encoder gate
-        self.encoder_gate = nn.Linear(4 * args.hidden_size + 2 * args.attr_dim, 3)
+        self.encoder_gate = nn.Linear(4 * args.hidden_size + 3 * args.attr_dim, 3)
 
         # Highway
-        self.highway_fusion = nn.Linear(2 * args.hidden_size + 2 * args.attr_dim, args.hidden_size)
+        self.highway_fusion = nn.Linear(2 * args.hidden_size + 3 * args.attr_dim, args.hidden_size)
         # Decoder
-        decode_size = args.embed_dim + args.hidden_size
-        if self.highway:
-            decode_size += args.hidden_size
+        decode_size = args.embed_dim + 2 * args.hidden_size
         self.decoder_rnn = nn.GRU(decode_size, args.hidden_size, args.rnn_layers, batch_first=True,
                                   dropout=args.decoder_dropout)
         # Text Attention
@@ -61,7 +63,7 @@ class MemAttrGate(nn.Module):
         # Memory Attention
         self.mem_context = nn.Linear(2 * args.hidden_size, args.hidden_size)
         # context gate
-        self.context_gate = nn.Linear(5 * args.hidden_size + args.embed_dim + args.attr_dim, 3)
+        self.context_gate = nn.Linear(args.hidden_size + args.embed_dim, 3)  # 先这么设定，后面可能吧context考虑进来
 
         # mix hidden and context into a context_hidden vector
         self.context_hidden = nn.Linear(2 * args.hidden_size, args.hidden_size)
@@ -78,10 +80,7 @@ class MemAttrGate(nn.Module):
         """Perform a single decoder step (1 word)"""
 
         # update rnn hidden state
-        if highway is not None and self.highway:
-            rnn_input = torch.cat([prev_embed, context_hidden, highway], dim=2)
-        else:
-            rnn_input = torch.cat([prev_embed, context_hidden], dim=2)
+        rnn_input = torch.cat([prev_embed, context_hidden, highway], dim=2)
         output, hidden = self.decoder_rnn(rnn_input, hidden)
 
         # compute context vector using attention mechanism
@@ -92,7 +91,7 @@ class MemAttrGate(nn.Module):
         text_context = self.text_context(context_text)
         attr_context = self.attr_context(context_attr)
         mem_context = self.mem_context(mem_out)
-        context_g = F.softmax(self.context_gate(torch.cat([query, prev_embed, context_text, context_attr, mem_out], dim=-1)), dim=-1)
+        context_g = F.softmax(self.context_gate(torch.cat([query, prev_embed], dim=-1)), dim=-1)
         context = torch.cat([text_context, attr_context, mem_context], dim=1)
         context = torch.bmm(context_g, context)
 
@@ -114,7 +113,7 @@ class MemAttrGate(nn.Module):
         mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
         return hidden, context_hidden, mix_prob
 
-    def forward(self, src, trg, src_, trg_, user, product, vocab_size, u_review, u_sum, p_review, p_sum, test=False):
+    def forward(self, src, trg, src_, trg_, user, product, rating, vocab_size, u_review, u_sum, p_review, p_sum, test=False):
         # useful variables
         batch_size = len(src)
         mem_size = self.args.mem_size
@@ -150,6 +149,26 @@ class MemAttrGate(nn.Module):
         bwd_final = encoder_final[1:encoder_final.size(0):2]
         encoder_final = torch.cat([fwd_final, bwd_final], dim=2).transpose(0, 1)  # encoder_final: [B, num_layers, 2H]
         text_final = self.text_final(encoder_final)  # text_final: [B, num_layers, H]
+
+        # predict rating score
+        encoder_method = 'avg'
+        if encoder_method == 'max':
+            rat_input = []
+            for i in range(batch_size):
+                cur_input, _ = torch.max(encoder_hidden[i][:src_lens[i]], dim=0)
+                rat_input.append(cur_input)
+            rat_input = torch.cat(rat_input, dim=-1).view(batch_size, -1)
+        elif encoder_method == 'avg':
+            rat_input = []
+            for i in range(batch_size):
+                cur_input = torch.sum(encoder_hidden[i][:src_lens[i]], dim=0)
+                rat_input.append(cur_input / src_lens[i])
+            rat_input = torch.cat(rat_input, dim=-1).view(batch_size, -1)
+        else:
+            rat_input = encoder_final[:, -1]
+        rat_output = self.rat_predict_2(F.relu(self.rat_predict_1(rat_input)))
+        rat_output = F.log_softmax(rat_output, dim=-1)
+        pre_rating = torch.argmax(rat_output, dim=-1)
 
         packed = pack_padded_sequence(u_review, u_review_lens, batch_first=True)
         _, review_final = self.review_encoder(packed)
@@ -197,12 +216,14 @@ class MemAttrGate(nn.Module):
 
         user_embed = self.user_embed(user)  # user_embed: [B, A]
         product_embed = self.product_embed(product)  # product_embed: [B, A]
-        attr_final = self.attr_final(torch.cat([user_embed, product_embed], dim=-1)).unsqueeze(1)
+        rating_embed = self.rating_embed(pre_rating) if test else self.rating_embed(rating)
+        attr_final = self.attr_final(torch.cat([user_embed, product_embed, rating_embed], dim=-1)).unsqueeze(1)
         attr_final = attr_final.repeat(1, text_final.size(1), 1)  # attr_final: [B, num_layers, H]
-        encoder_attr = torch.cat([user_embed, product_embed], dim=-1).view(user_embed.size(0), 2, -1)
+        encoder_attr = torch.cat([user_embed, product_embed, rating_embed], dim=-1).view(user_embed.size(0), 3, -1)
 
         encoder_g = F.softmax(self.encoder_gate(
-            torch.cat([encoder_final[:, -1], user_embed, product_embed, mem_out.squeeze(1)], dim=-1)), dim=-1)
+            torch.cat([encoder_final[:, -1], user_embed, product_embed, rating_embed, mem_out.squeeze(1)], dim=-1)),
+            dim=-1)
 
         encoder_final = torch.cat([text_final.view(batch_size, 1, -1), attr_final.view(batch_size, 1, -1),
                                    mem_final.view(batch_size, 1, -1)], dim=1)
@@ -213,10 +234,9 @@ class MemAttrGate(nn.Module):
         max_len = self.args.sum_max_len
         hidden = encoder_final.contiguous()
         context_hidden = hidden[-1].unsqueeze(1)  # context_hidden指融合了context信息的hidden，初始化为hidden[-1]
-        highway = None
-        if self.highway:
-            highway = self.highway_fusion(torch.cat([user_embed.unsqueeze(1), product_embed.unsqueeze(1), mem_out],
-                                                    dim=-1)).contiguous()
+        highway = self.highway_fusion(
+            torch.cat([user_embed.unsqueeze(1), product_embed.unsqueeze(1), rating_embed.unsqueeze(1), mem_out],
+                      dim=-1)).contiguous()
 
         # pre-compute projected encoder hidden states(the "keys" for the attention mechanism)
         # this is only done for efficiency
@@ -242,7 +262,7 @@ class MemAttrGate(nn.Module):
                                                                  context_hidden, vocab_size, mem_out, highway)
             pre_output_vectors.append(word_prob)
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
-        return pre_output_vectors
+        return pre_output_vectors, rat_output
 
     def save(self, dir):
         checkpoint = {'model': self.state_dict(), 'args': self.args}
