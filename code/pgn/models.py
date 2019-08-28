@@ -9,7 +9,7 @@ class EncoderDecoder(nn.Module):
 
     def __init__(self, args, embed):
         super(EncoderDecoder, self).__init__()
-        self.name = 'seq2seqAttn'
+        self.name = 'pgn'
         self.args = args
         # Embedding layer
         self.embed = nn.Embedding(args.embed_num, args.embed_dim)
@@ -23,12 +23,18 @@ class EncoderDecoder(nn.Module):
         # Decoder
         self.decoder_rnn = nn.GRU(args.embed_dim + args.hidden_size, args.hidden_size, args.num_layers,
                                   batch_first=True, dropout=args.decoder_dropout)
+        # init decoder hidden from encoder final hidden
         self.init_hidden = nn.Linear(2 * args.hidden_size, args.hidden_size)
         self.dropout_layer = nn.Dropout(p=args.decoder_dropout)
+        # mix hidden and context into a context_hidden vector
         self.context_hidden = nn.Linear(3 * args.hidden_size, args.hidden_size, bias=False)
+        # generate mode probability layer
+        self.gen_p = nn.Linear(3 * args.hidden_size + args.embed_dim, 1)
+        # generate mode layer, context_hidden => word distribution over fixed vocab, P(changeable vocab) = 0
         self.generator = nn.Linear(args.hidden_size, args.embed_num, bias=False)
+        # copy mode layer, no learnable paras, attn_scores => word distribution over src vocab, P(other vocab) = 0
 
-    def decode_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden):
+    def decode_step(self, src, prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden, vocab_size):
         """Perform a single decoder step (1 word)"""
 
         # update rnn hidden state
@@ -38,15 +44,28 @@ class EncoderDecoder(nn.Module):
         # compute context vector using attention mechanism
         query = hidden[-1].unsqueeze(1)  # [B, 1, H]
         context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
+
+        # generate mode word distribution
         context_hidden = torch.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
-        pre_output = self.dropout_layer(context_hidden)
-        pre_output = self.generator(pre_output)
+        context_hidden_1 = self.dropout_layer(context_hidden)
+        gen_prob = F.softmax(self.generator(context_hidden_1), dim=-1)
+        if vocab_size > gen_prob.size(2):
+            gen_prob = torch.cat(
+                [gen_prob, torch.zeros(gen_prob.size(0), gen_prob.size(1), vocab_size - gen_prob.size(2)).cuda()],
+                dim=-1)
 
-        return hidden, context_hidden, pre_output
+        # copy mode word distribution
+        src = src.unsqueeze(1)
+        copy_prob = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_add(2, src, attn_probs)
 
-    def forward(self, src, trg, src_mask, src_lengths, trg_lengths, test=False):
+        # generate probability p
+        gen_p = torch.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
+        mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
+        return hidden, context_hidden, mix_prob
+
+    def forward(self, src, trg, src_, trg_, vocab_size, src_mask, src_lengths, trg_lengths, test=False):
         # embed input
-        src_embed = self.embed(src)  # x: [B, S, D]
+        src_embed = self.embed(src_)  # x: [B, S, D]
 
         # feed input to encoder RNN
         packed = pack_padded_sequence(src_embed, src_lengths, batch_first=True)
@@ -58,7 +77,7 @@ class EncoderDecoder(nn.Module):
         bwd_final = encoder_final[1:encoder_final.size(0):2]
         encoder_final = torch.cat([fwd_final, bwd_final], dim=2)  # encoder_final: [num_layers, B, 2H]
 
-        trg_embed = self.embed(trg)
+        trg_embed = self.embed(trg_)
         max_len = self.args.sum_max_len
         hidden = torch.tanh(self.init_hidden(encoder_final))
         context_hidden = hidden[-1].unsqueeze(1)
@@ -77,10 +96,13 @@ class EncoderDecoder(nn.Module):
                     prev_embed = trg_embed[:, i - 1].unsqueeze(1)
                 else:  # last predicted word embedding
                     prev_idx = torch.argmax(pre_output_vectors[-1], dim=-1)
+                    for j in range(0, prev_idx.size(0)):
+                        if prev_idx[j][0] >= self.args.embed_num:
+                            prev_idx[j][0] = 3  # UNK_IDX
                     prev_embed = self.embed(prev_idx)
-            hidden, context_hidden, pre_output = self.decode_step(prev_embed, encoder_hidden, src_mask, proj_key, hidden, context_hidden)
-            pre_output_vectors.append(F.log_softmax(pre_output, dim=-1))
-
+            hidden, context_hidden, word_prob = self.decode_step(src, prev_embed, encoder_hidden, src_mask, proj_key,
+                                                                 hidden, context_hidden, vocab_size)
+            pre_output_vectors.append(word_prob)
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
 
         return pre_output_vectors
@@ -131,3 +153,19 @@ class Attention(nn.Module):
 
         # context shape: [B, 1, 2*H], alphas shape: [B, 1, max_len]
         return context, alphas
+
+
+class myNLLLoss(nn.Module):
+    def __init__(self):
+        super(myNLLLoss, self).__init__()
+
+    def forward(self, output, target):
+        rst = torch.FloatTensor([0]).cuda().squeeze(0)
+        for dis, idx in zip(output, target):
+            if idx == 0:
+                continue
+            if dis[idx] == float('-inf'):
+                print('error!')
+                exit()
+            rst -= dis[idx]
+        return rst

@@ -1,7 +1,6 @@
 # coding: utf-8
 
-# Use seq2seq + Luong attention to generate amazon review summaries.
-# Ref: https://bastings.github.io/annotated_encoder_decoder/
+# Use seq2seq + Luong attention + copy mechanism to generate amazon review summaries.
 
 import os
 import json
@@ -15,11 +14,10 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from vocab import Vocab
 from dataset import Dataset
-from models import EncoderDecoder
+from models import EncoderDecoder, myNLLLoss
 from sumeval.metrics.rouge import RougeCalculator
 
-
-parser = argparse.ArgumentParser(description='seq2seqAttn')
+parser = argparse.ArgumentParser(description='pgn')
 # path info
 parser.add_argument('-save_path', type=str, default='checkpoints/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
@@ -78,31 +76,32 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
     sums = []
     loss, r1, r2, rl = .0, .0, .0, .0
     rouge = RougeCalculator(stopwords=False, lang="en")
-    for batch in tqdm(data_iter):
-        src, trg, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.make_tensors(batch)
-        pre = net(src, trg, src_mask, src_lens, trg_lens, test=True)
-        pre1 = net(src, trg, src_mask, src_lens, trg_lens, test=False)
-        pre_output = pre1.view(-1, pre.size(-1))
-        trg_output = trg.view(-1)
-        loss += criterion(pre_output, trg_output).data.item() / len(src_lens)
-        reviews.extend(src_text)
-        refs.extend(trg_text)
-        pre[:, :, 3] = float('-inf')
-        rst = torch.argmax(pre, dim=-1).tolist()
-        for i, summary in enumerate(rst):
-            cur_sum = ['']
-            for idx in summary:
-                if idx == vocab.EOS_IDX:
-                    break
-                w = vocab.id_word(idx)
-                cur_sum.append(w)
-            cur_sum = ' '.join(cur_sum).strip()
-            if len(cur_sum) == 0:
-                cur_sum = '<EMP>'
-            sums.append(cur_sum)
-            r1 += rouge.rouge_n(cur_sum, trg_text[i], n=1)
-            r2 += rouge.rouge_n(cur_sum, trg_text[i], n=2)
-            rl += rouge.rouge_l(cur_sum, trg_text[i])
+    with torch.no_grad():
+        for batch in tqdm(data_iter):
+            src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text = vocab.read_batch(batch)
+            pre_output1 = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens)
+            pre_output = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens, test=True)
+            output = torch.log(pre_output1.view(-1, pre_output1.size(-1)) + 1e-20)
+            trg_output = trg.view(-1)
+            loss += criterion(output, trg_output).data.item() / len(src_lens)
+            reviews.extend(src_text)
+            refs.extend(trg_text)
+            pre_output[:, :, 3] = float('-inf')
+            rst = torch.argmax(pre_output, dim=-1).tolist()
+            for i, summary in enumerate(rst):
+                cur_sum = ['']
+                for idx in summary:
+                    if idx == vocab.EOS_IDX:
+                        break
+                    w = vocab.id_word(idx)
+                    cur_sum.append(w)
+                cur_sum = ' '.join(cur_sum).strip()
+                if len(cur_sum) == 0:
+                    cur_sum = '<EMP>'
+                sums.append(cur_sum)
+                r1 += rouge.rouge_n(cur_sum, trg_text[i], n=1)
+                r2 += rouge.rouge_n(cur_sum, trg_text[i], n=2)
+                rl += rouge.rouge_l(cur_sum, trg_text[i])
     for i in example_idx:
         print('> %s' % reviews[i])
         print('= %s' % refs[i])
@@ -123,16 +122,17 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
 
 
 def train():
-    print('Loading pretrained word embedding...')
-    embed = {}
-    with open(args.embed_path, 'r') as f:
-        f.readline()
-        for line in f.readlines():
-            line = line.strip().split()
-            vec = [float(_) for _ in line[1:]]
-            embed[line[0]] = vec
+    embed = None
+    if args.embed_path is not None and os.path.exists(args.embed_path):
+        print('Loading pretrained word embedding...')
+        embed = {}
+        with open(args.embed_path, 'r') as f:
+            f.readline()
+            for line in f.readlines():
+                line = line.strip().split()
+                vec = [float(_) for _ in line[1:]]
+                embed[line[0]] = vec
     vocab = Vocab(args, embed)
-
     print('Loading datasets...')
     train_data, val_data, test_data = [], [], []
     fns = os.listdir(args.train_dir)
@@ -162,6 +162,7 @@ def train():
 
     print('Deleting rare words...')
     embed = vocab.trim()
+
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
 
@@ -175,15 +176,14 @@ def train():
         net.cuda()
     criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, reduction='sum')
     optim = torch.optim.Adam(net.parameters(), lr=args.lr)
-
     print('Begin training...')
     for epoch in range(1, args.epochs + 1):
         if epoch >= args.lr_decay_start:
             adjust_learning_rate(optim, epoch - args.lr_decay_start + 1)
         for i, batch in enumerate(train_iter):
-            src, trg, src_mask, src_lens, trg_lens, _1, _2 = vocab.make_tensors(batch)
-            pre_output = net(src, trg, src_mask, src_lens, trg_lens)
-            pre_output = pre_output.view(-1, pre_output.size(-1))
+            src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, _1, _2 = vocab.read_batch(batch)
+            pre_output = net(src, trg, src_embed, trg_embed, vocab.word_num, src_mask, src_lens, trg_lens)
+            pre_output = torch.log(pre_output.view(-1, pre_output.size(-1)) + 1e-20)
             trg_output = trg.view(-1)
             loss = criterion(pre_output, trg_output) / len(src_lens)
             loss.backward()
@@ -195,7 +195,7 @@ def train():
             if cnt % args.print_every == 0:
                 print('EPOCH [%d/%d]: BATCH_ID=[%d/%d] loss=%f' % (epoch, args.epochs, i, len(train_iter), loss.data))
 
-            if cnt % args.valid_every == 0 and cnt / args.valid_every >= 0:
+            if cnt % args.valid_every == 0:
                 print('Begin valid... Epoch %d, Batch %d' % (epoch, i))
                 cur_loss, r1, r2, rl = evaluate(net, criterion, vocab, val_iter, True)
                 save_path = args.save_path + 'valid_%d_%.4f_%.4f_%.4f_%.4f' % (
@@ -203,18 +203,21 @@ def train():
                 net.save(save_path)
                 print('Epoch: %2d Cur_Val_Loss: %f Rouge-1: %f Rouge-2: %f Rouge-l: %f' %
                       (epoch, cur_loss, r1, r2, rl))
+
     return
 
 
 def test():
-    print('Loading vocab and test dataset...')
-    embed = {}
-    with open(args.embed_path, 'r') as f:
-        f.readline()
-        for line in f.readlines():
-            line = line.strip().split()
-            vec = [float(_) for _ in line[1:]]
-            embed[line[0]] = vec
+    embed = None
+    if args.embed_path is not None and os.path.exists(args.embed_path):
+        print('Loading pretrained word embedding...')
+        embed = {}
+        with open(args.embed_path, 'r') as f:
+            f.readline()
+            for line in f.readlines():
+                line = line.strip().split()
+                vec = [float(_) for _ in line[1:]]
+                embed[line[0]] = vec
     vocab = Vocab(args, embed)
 
     train_data, val_data, test_data = [], [], []
@@ -254,7 +257,7 @@ def test():
     net.load_state_dict(checkpoint['model'])
     if args.use_cuda:
         net.cuda()
-    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX)
+    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, reduction='sum')
 
     print('Begin testing...')
     loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, False)

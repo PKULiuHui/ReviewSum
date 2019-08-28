@@ -3,12 +3,11 @@ import torch
 import numpy as np
 
 
-# Vocab：记录词典（词典由pretrained embed和数据集中的常见词组成）;记录初始embedding;将一个batch的数据转成tensor
 class Vocab:
     def __init__(self, args, embed=None):
         self.args = args
         self.pretrained_embed = embed
-        self.embed = []  # pretrained embed是embed的一部分
+        self.embed = []
         self.PAD_IDX = 0
         self.SOS_IDX = 1
         self.EOS_IDX = 2
@@ -22,7 +21,7 @@ class Vocab:
                         self.UNK_TOKEN: self.UNK_IDX}
         self.id2word = {v: k for k, v in self.word2id.items()}
         self.word2cnt = {self.PAD_TOKEN: 10000, self.SOS_TOKEN: 10000, self.EOS_TOKEN: 10000,
-                         self.UNK_TOKEN: 10000}  # 给这几个标记较大的值防止后面被删去
+                         self.UNK_TOKEN: 10000}
         for i in range(4):
             self.embed.append(np.random.normal(size=args.embed_dim))
         if embed is not None:
@@ -34,7 +33,6 @@ class Vocab:
                     self.embed.append(embed[w])
                     self.next_idx += 1
 
-    # 读取一个句子，更新词表以及相关记录
     def add_sentence(self, sent):
         for w in sent:
             if w not in self.word2id:
@@ -46,7 +44,6 @@ class Vocab:
             else:
                 self.word2cnt[w] += 1
 
-    # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量
     def trim(self):
         print('original vocab size: %d' % len(self.word2cnt))
         reserved_words, reserved_idx = [], []
@@ -82,13 +79,13 @@ class Vocab:
         assert 0 <= idx < len(self.id2word)
         return self.id2word[idx]
 
-    # 给定一个batch的文本数据，生成神经网络所需要的input tensors
+    # generate tensors for a batch
     def make_tensors(self, batch):
-        src_text, trg_text = [], []  # 存储评论和摘要的文本，便于valid时查看效果，按照评论长度由大到小排序
+        src_text, trg_text = [], []
         for review, summary in zip(batch['reviewText'], batch['summary']):
             src_text.append(review)
             trg_text.append(summary)
-        idx = list(range(len(batch['summary'])))  # 将一个batch中的数据由长到短排序，方便作为GRU输入
+        idx = list(range(len(batch['summary'])))
         idx.sort(key=lambda k: len(src_text[k].split()), reverse=True)
         src_text = [src_text[i] for i in idx]
         trg_text = [trg_text[i] for i in idx]

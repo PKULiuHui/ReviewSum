@@ -81,10 +81,10 @@ class MemAttrLinear(nn.Module):
         context_attr, _ = self.attention_attr(query=query, proj_key=proj_key_attr, value=encoder_attr)
 
         # get context from context_text, context_attr, context_mem(mem_out)
-        context = F.tanh(self.context(torch.cat([context_text, context_attr, mem_out], dim=-1)))
+        context = torch.tanh(self.context(torch.cat([context_text, context_attr, mem_out], dim=-1)))
 
-        # 计算generate mode下的word distribution，非固定词表部分概率为0
-        context_hidden = F.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
+        # generate mode word distribution
+        context_hidden = torch.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
         context_hidden = self.dropout_layer(context_hidden)
         gen_prob = F.softmax(self.generator(context_hidden), dim=-1)
         if vocab_size > gen_prob.size(2):
@@ -92,12 +92,12 @@ class MemAttrLinear(nn.Module):
                 [gen_prob, torch.zeros(gen_prob.size(0), gen_prob.size(1), vocab_size - gen_prob.size(2)).cuda()],
                 dim=-1)
 
-        # 计算copy mode下的word distribution，非src中的词概率为0
+        # copy mode word distribution
         src = src.unsqueeze(1)
         copy_prob = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_add(2, src, attn_probs)
 
-        # 计算generate的概率p
-        gen_p = F.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
+        # generate probability p
+        gen_p = torch.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
         mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
         return hidden, context_hidden, mix_prob
 
@@ -196,7 +196,7 @@ class MemAttrLinear(nn.Module):
         trg_embed = self.embed(trg_)
         max_len = self.args.sum_max_len
         hidden = encoder_final.contiguous()
-        context_hidden = hidden[-1].unsqueeze(1)  # context_hidden指融合了context信息的hidden，初始化为hidden[-1]
+        context_hidden = hidden[-1].unsqueeze(1)
 
         # pre-compute projected encoder hidden states(the "keys" for the attention mechanism)
         # this is only done for efficiency

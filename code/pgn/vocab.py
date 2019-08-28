@@ -3,10 +3,12 @@ import torch
 import numpy as np
 
 
+# Vocab: composed of two parts
+# Part 1: fixed part, composed of popular words
+# Part 2: changeable part, composed of words appearing in current batch but not in fixed vocab
 class Vocab:
     def __init__(self, args, embed=None):
         self.args = args
-        self.pretrained_embed = embed
         self.embed = []
         self.PAD_IDX = 0
         self.SOS_IDX = 1
@@ -16,7 +18,8 @@ class Vocab:
         self.SOS_TOKEN = '<SOS>'
         self.EOS_TOKEN = '<EOS>'
         self.UNK_TOKEN = '<UNK>'
-        self.next_idx = 4
+        self.word_num = 4
+        self.fixed_num = 4
         self.word2id = {self.PAD_TOKEN: self.PAD_IDX, self.SOS_TOKEN: self.SOS_IDX, self.EOS_TOKEN: self.EOS_IDX,
                         self.UNK_TOKEN: self.UNK_IDX}
         self.id2word = {v: k for k, v in self.word2id.items()}
@@ -27,27 +30,29 @@ class Vocab:
         if embed is not None:
             for w in sorted(embed.keys()):
                 if w not in self.word2id:
-                    self.word2id[w] = self.next_idx
-                    self.id2word[self.next_idx] = w
+                    self.word2id[w] = self.word_num
+                    self.id2word[self.word_num] = w
                     self.word2cnt[w] = 0
                     self.embed.append(embed[w])
-                    self.next_idx += 1
+                    self.word_num += 1
+        self.fixed_num = self.word_num
 
     def add_sentence(self, sent):
         for w in sent:
             if w not in self.word2id:
-                self.word2id[w] = self.next_idx
-                self.id2word[self.next_idx] = w
+                self.word2id[w] = self.word_num
+                self.id2word[self.word_num] = w
                 self.word2cnt[w] = 1
                 self.embed.append(np.random.normal(size=self.args.embed_dim))
-                self.next_idx += 1
+                self.word_num += 1
             else:
                 self.word2cnt[w] += 1
+        self.fixed_num = self.word_num
 
     def trim(self):
         print('original vocab size: %d' % len(self.word2cnt))
         reserved_words, reserved_idx = [], []
-        for i in range(self.next_idx):
+        for i in range(self.word_num):
             w = self.id2word[i]
             if self.word2cnt[w] >= self.args.word_min_cnt:
                 reserved_words.append(w)
@@ -62,6 +67,8 @@ class Vocab:
             cnt += 1
         for i in reserved_idx:
             embed.append(self.embed[i])
+        self.word_num = cnt
+        self.fixed_num = cnt
         assert len(word2id) == len(id2word) and len(id2word) == len(word2cnt) and len(word2cnt) == len(embed)
         self.word2id, self.id2word, self.word2cnt, self.embed = word2id, id2word, word2cnt, embed
         print('Vocab size: %d' % len(self.word2id))
@@ -76,11 +83,18 @@ class Vocab:
         return self.UNK_IDX
 
     def id_word(self, idx):
-        assert 0 <= idx < len(self.id2word)
+        assert 0 <= idx < self.word_num
         return self.id2word[idx]
 
     # generate tensors for a batch
-    def make_tensors(self, batch):
+    def read_batch(self, batch):
+        # delete the last changeable vocab part
+        for i in range(self.fixed_num, self.word_num):
+            w = self.id_word(i)
+            self.id2word.pop(i)
+            self.word2id.pop(w)
+        self.word_num = self.fixed_num
+
         src_text, trg_text = [], []
         for review, summary in zip(batch['reviewText'], batch['summary']):
             src_text.append(review)
@@ -90,9 +104,19 @@ class Vocab:
         src_text = [src_text[i] for i in idx]
         trg_text = [trg_text[i] for i in idx]
 
+        # generate changeable part for current batch
+        for review in src_text:
+            review = review.split()
+            for w in review:
+                if w not in self.word2id:
+                    self.word2id[w] = self.word_num
+                    self.id2word[self.word_num] = w
+                    self.word_num += 1
+
         src_max_len = len(src_text[0].split())
         trg_max_len = self.args.sum_max_len
         src, trg, src_mask, src_lens, trg_lens = [], [], [], [], []
+        src_embed, trg_embed = [], []
         for review in src_text:
             review = review.split()[:src_max_len]
             cur_idx = []
@@ -100,19 +124,26 @@ class Vocab:
                 cur_idx.append(self.word_id(w))
             cur_idx.extend([self.PAD_IDX] * (src_max_len - len(review)))
             src.append(cur_idx)
+            src_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
             src_mask.append([1] * len(review) + [0] * (src_max_len - len(review)))
             src_lens.append(len(review))
-        for summary in trg_text:
+        for i, summary in enumerate(trg_text):
             summary = summary.split() + [self.EOS_TOKEN]
             summary = summary[:trg_max_len]
             cur_idx = []
             for w in summary:
-                cur_idx.append(self.word_id(w))
+                cur_id = self.word_id(w)
+                if cur_id >= self.fixed_num and cur_id not in src[i]:
+                    cur_id = self.UNK_IDX
+                cur_idx.append(cur_id)
             cur_idx.extend([self.PAD_IDX] * (trg_max_len - len(summary)))
             trg.append(cur_idx)
+            trg_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
             trg_lens.append(len(summary))
         src, trg, src_mask = torch.LongTensor(src), torch.LongTensor(trg), torch.LongTensor(src_mask)
+        src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)
         if self.args.use_cuda:
             src, trg, src_mask = src.cuda(), trg.cuda(), src_mask.cuda()
+            src_embed, trg_embed = src_embed.cuda(), trg_embed.cuda()
 
-        return src, trg, src_mask, src_lens, trg_lens, src_text, trg_text
+        return src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text

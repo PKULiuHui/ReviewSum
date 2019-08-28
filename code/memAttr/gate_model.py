@@ -98,8 +98,8 @@ class MemAttrGate(nn.Module):
         context = torch.cat([text_context, attr_context, mem_context], dim=1)
         context = torch.bmm(context_g, context)
 
-        # 计算generate mode下的word distribution，非固定词表部分概率为0
-        context_hidden = F.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
+        # generate mode word distribution
+        context_hidden = torch.tanh(self.context_hidden(torch.cat([query, context], dim=2)))
         context_hidden = self.dropout_layer(context_hidden)
         gen_prob = F.softmax(self.generator(context_hidden), dim=-1)
         if vocab_size > gen_prob.size(2):
@@ -107,12 +107,12 @@ class MemAttrGate(nn.Module):
                 [gen_prob, torch.zeros(gen_prob.size(0), gen_prob.size(1), vocab_size - gen_prob.size(2)).cuda()],
                 dim=-1)
 
-        # 计算copy mode下的word distribution，非src中的词概率为0
+        # copy mode word distribution
         src = src.unsqueeze(1)
         copy_prob = torch.zeros(src.size(0), src.size(1), vocab_size).cuda().scatter_add(2, src, attn_probs)
 
-        # 计算generate的概率p
-        gen_p = F.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
+        # generate probability p
+        gen_p = torch.sigmoid(self.gen_p(torch.cat([context, query, prev_embed], -1)))
         mix_prob = gen_p * gen_prob + (1 - gen_p) * copy_prob
         return hidden, context_hidden, mix_prob, context_gate
 
@@ -219,7 +219,7 @@ class MemAttrGate(nn.Module):
         trg_embed = self.embed(trg_)
         max_len = self.args.sum_max_len
         hidden = encoder_final.contiguous()
-        context_hidden = hidden[-1].unsqueeze(1)  # context_hidden指融合了context信息的hidden，初始化为hidden[-1]
+        context_hidden = hidden[-1].unsqueeze(1)
         highway = None
         if self.highway:
             highway = self.highway_fusion(torch.cat([user_embed.unsqueeze(1), product_embed.unsqueeze(1), mem_out],
@@ -252,7 +252,7 @@ class MemAttrGate(nn.Module):
             for k in range(batch_size):
                 context_gate[k].append(context_g[k])
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
-        return pre_output_vectors, encoder_gate, context_gate
+        return pre_output_vectors
 
     def save(self, dir):
         checkpoint = {'model': self.state_dict(), 'args': self.args}

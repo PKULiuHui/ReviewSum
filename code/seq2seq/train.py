@@ -59,6 +59,10 @@ if args.use_cuda:
 random.seed(args.seed)
 np.random.seed(args.seed)
 example_idx = np.random.choice(range(5000), args.example_num)
+if not os.path.exists(args.save_path):
+    os.mkdir(args.save_path)
+if not os.path.exists(args.output_dir):
+    os.mkdir(args.output_dir)
 
 
 def adjust_learning_rate(optimizer, index):
@@ -102,7 +106,7 @@ def evaluate(net, criterion, vocab, data_iter, train_next=True):
         print('> %s' % reviews[i])
         print('= %s' % refs[i])
         print('< %s\n' % sums[i])
-    if not train_next:  # 测试阶段将结果写入文件
+    if not train_next:
         with open(args.output_dir + args.load_model, 'w') as f:
             for review, ref, summary in zip(reviews, refs, sums):
                 f.write('> %s\n' % review)
@@ -161,14 +165,14 @@ def train():
     args.embed_dim = len(embed[0])
 
     train_dataset = Dataset(train_data)
-    val_dataset = Dataset(test_data)
+    val_dataset = Dataset(val_data)
     train_iter = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True)
     val_iter = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False)
 
     net = EncoderDecoder(args, embed)
     if args.use_cuda:
         net.cuda()
-    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, size_average=False)
+    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, reduction='sum')
     optim = torch.optim.Adam(net.parameters(), lr=args.lr)
 
     print('Begin training...')
@@ -249,7 +253,7 @@ def test():
     net.load_state_dict(checkpoint['model'])
     if args.use_cuda:
         net.cuda()
-    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, size_average=False)
+    criterion = nn.NLLLoss(ignore_index=vocab.PAD_IDX, reduction='sum')
 
     print('Begin testing...')
     loss, r1, r2, rl = evaluate(net, criterion, vocab, test_iter, False)
