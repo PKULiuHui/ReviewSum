@@ -20,7 +20,7 @@ from sumeval.metrics.rouge import RougeCalculator
 
 parser = argparse.ArgumentParser(description='HSSC')
 # path info
-parser.add_argument('-save_path', type=str, default='checkpoints3/')
+parser.add_argument('-save_path', type=str, default='checkpoints/')
 parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/aligned/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/aligned/valid/')
@@ -35,16 +35,17 @@ parser.add_argument('-rating_range', type=int, default=5)
 parser.add_argument('-word_min_cnt', type=int, default=20)
 parser.add_argument('-sum_max_len', type=int, default=15)
 parser.add_argument('-hidden_size', type=int, default=512)
-parser.add_argument('-num_layers', type=int, default=1)
+parser.add_argument('-num_layers', type=int, default=2)
 parser.add_argument('-encoder_dropout', type=float, default=0.1)
 parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay', type=float, default=0.5)
+parser.add_argument('-lr_decay_start', type=int, default=6)
 parser.add_argument('-loss_ratio', type=float, default=0.5)
 parser.add_argument('-max_norm', type=float, default=5.0)
 parser.add_argument('-batch_size', type=int, default=32)
-parser.add_argument('-epochs', type=int, default=12)
-parser.add_argument('-seed', type=int, default=233)
+parser.add_argument('-epochs', type=int, default=10)
+parser.add_argument('-seed', type=int, default=2333)
 parser.add_argument('-print_every', type=int, default=10)
 parser.add_argument('-valid_every', type=int, default=1000)
 parser.add_argument('-test', action='store_true')
@@ -173,7 +174,7 @@ def train():
     train_dataset = Dataset(train_data)
     val_dataset = Dataset(test_data)
     train_iter = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=my_collate)
-    val_iter = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=my_collate)
+    val_iter = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=my_collate)
 
     net = EncoderDecoder(args, embed)
     if args.use_cuda:
@@ -184,6 +185,8 @@ def train():
 
     print('Begin training...')
     for epoch in range(1, args.epochs + 1):
+        if epoch >= args.lr_decay_start:
+            adjust_learning_rate(optim, epoch - args.lr_decay_start + 1)
         for i, batch in enumerate(train_iter):
             src, trg, src_mask, src_lens, trg_lens, rating, _1, _2 = vocab.make_tensors(batch)
             pre_output, pre_rating = net(src, trg, src_mask, src_lens, trg_lens)
@@ -256,7 +259,7 @@ def test():
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
     test_dataset = Dataset(test_data)
-    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
+    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False)
 
     print('Loading model...')
     checkpoint = torch.load(args.save_path + args.load_model)

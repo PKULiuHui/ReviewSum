@@ -87,13 +87,15 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
     sums = []
     loss, r1, r2, rl = .0, .0, .0, .0
     rouge = RougeCalculator(stopwords=False, lang="en")
+    encoder_gate, context_gate = [], []
     for batch in tqdm(data_iter):
         src, trg, src_embed, trg_embed, src_user, src_product, u_review, u_sum, p_review, p_sum, src_text, trg_text \
             = vocab.make_tensors(batch, train_data)
-        sum_out = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, u_review, u_sum,
-                      p_review, p_sum, test=True)
-        sum_out_1 = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, u_review, u_sum,
-                        p_review, p_sum, test=False)
+        sum_out, encoder_g, context_g = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num,
+                                            u_review, u_sum, p_review, p_sum, test=True)
+        encoder_gate.extend(encoder_g)
+        sum_out_1, _1, _2 = net(src, trg, src_embed, trg_embed, src_user, src_product, vocab.word_num, u_review, u_sum,
+                                p_review, p_sum, test=False)
         sum_out_1 = torch.log(sum_out_1.view(-1, sum_out_1.size(-1)) + 1e-20)
         sum_out_gold = trg.view(-1)
         loss += criterion(sum_out_1, sum_out_gold).data.item() / len(src)
@@ -103,9 +105,10 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
         rst = torch.argmax(sum_out, dim=-1).tolist()
         for i, summary in enumerate(rst):
             cur_sum = ['']
-            for idx in summary:
+            for j, idx in enumerate(summary):
                 if idx == vocab.EOS_IDX:
                     break
+                context_gate.append(context_g[i][j])
                 w = vocab.id_word(idx)
                 cur_sum.append(w)
             cur_sum = ' '.join(cur_sum).strip()
@@ -125,6 +128,14 @@ def evaluate(net, criterion, vocab, data_iter, train_data, train_next=True):
                 f.write('> %s\n' % review)
                 f.write('= %s\n' % ref)
                 f.write('< %s\n\n' % summary)
+        print(len(encoder_gate))
+        print(len(context_gate))
+        with open(args.output_dir + 'encoder_g', 'w') as f:
+            for values in encoder_gate:
+                f.write('%.4f %.4f %.4f\n' % (values[0], values[1], values[2]))
+        with open(args.output_dir + 'context_g', 'w') as f:
+            for values in context_gate:
+                f.write('%.4f %.4f %.4f\n' % (values[0], values[1], values[2]))
     loss /= len(data_iter)
     r1 /= len(sums)
     r2 /= len(sums)

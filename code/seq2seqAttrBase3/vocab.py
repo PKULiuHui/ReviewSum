@@ -105,9 +105,6 @@ class Vocab:
         assert len(word2id) == len(id2word) and len(id2word) == len(word2cnt) and len(word2cnt) == len(embed)
         self.word2id, self.id2word, self.word2cnt, self.embed = word2id, id2word, word2cnt, embed
         print('Vocab size: %d' % len(self.word2id))
-        embed = torch.FloatTensor(embed)
-        if self.args.use_cuda:
-            embed = embed.cuda()
 
         print('original user num = %d, product num = %d' % (self.user_num, self.product_num))
         reserved_user, reserved_product = [], []
@@ -139,7 +136,27 @@ class Vocab:
         self.product_num = cnt
         self.product2id, self.id2product, self.product2cnt = product2id, id2product, product2cnt
         print('user num = %d, product num = %d' % (self.user_num, self.product_num))
-        return embed
+
+        # 将保留下来的userID和productID存入词典中
+        for i in range(self.user_num):
+            user = self.id2user[i]
+            self.word2id[user] = self.fixed_num
+            self.id2word[self.fixed_num] = user
+            self.word2cnt[user] = 10000
+            self.embed.append(np.random.normal(size=self.args.embed_dim))
+            self.fixed_num += 1
+        for i in range(self.product_num):
+            pro = self.id2product[i]
+            self.word2id[pro] = self.fixed_num
+            self.id2word[self.fixed_num] = pro
+            self.word2cnt[pro] = 10000
+            self.embed.append(np.random.normal(size=self.args.embed_dim))
+            self.fixed_num += 1
+        self.word_num = self.fixed_num
+        self.embed = torch.FloatTensor(self.embed)
+        if self.args.use_cuda:
+            self.embed = self.embed.cuda()
+        return self.embed
 
     def word_id(self, w):
         if w in self.word2id:
@@ -180,12 +197,17 @@ class Vocab:
                     self.word_num += 1
 
         # 生成神经网络所需要的input tensors
-        src_max_len = len(src_text[0].split())
+        src_max_len = len(src_text[0].split()) + 2
         trg_max_len = self.args.sum_max_len
         src, trg, src_mask, src_lens, trg_lens = [], [], [], [], []
         src_embed, trg_embed = [], []  # 针对embed的src和trg输入，与src和trg相比，将处于可变词典的词序号替换成UNK_IDX
-        for review in src_text:
-            review = review.split()[:src_max_len]
+        for i, review in zip(idx, src_text):
+            user, product = batch['userID'][i], batch['productID'][i]
+            assert user in self.user2id and product in self.product2id
+            user = user if user in self.user2id else '<UNK-USER>'
+            product = product if product in self.product2id else '<UNK-PRODUCT>'
+            review = [user, product] + review.split()[:src_max_len - 2]
+            # review = review.split()[:src_max_len]
             cur_idx = []
             for w in review:
                 cur_idx.append(self.word_id(w))
@@ -208,28 +230,13 @@ class Vocab:
             trg_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
             trg_lens.append(len(summary))
 
-        src_user, src_product = [], []
-        for i in idx:
-            user = batch['userID'][i]
-            product = batch['productID'][i]
-            if user in self.user2id:
-                src_user.append(self.user2id[user])
-            else:
-                src_user.append(0)
-            if product in self.product2id:
-                src_product.append(self.product2id[product])
-            else:
-                src_product.append(0)
-
         src, trg, src_mask = torch.LongTensor(src), torch.LongTensor(trg), torch.LongTensor(src_mask)
         src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)
-        src_user, src_product = torch.LongTensor(src_user), torch.LongTensor(src_product)
         if self.args.use_cuda:
             src, trg, src_mask = src.cuda(), trg.cuda(), src_mask.cuda()
             src_embed, trg_embed = src_embed.cuda(), trg_embed.cuda()
-            src_user, src_product = src_user.cuda(), src_product.cuda()
 
-        return src, trg, src_embed, trg_embed, src_user, src_product, src_mask, src_lens, trg_lens, src_text, trg_text
+        return src, trg, src_embed, trg_embed, src_mask, src_lens, trg_lens, src_text, trg_text
 
 
 class Dataset(data.Dataset):

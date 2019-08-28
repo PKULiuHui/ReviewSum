@@ -22,7 +22,7 @@ from sumeval.metrics.rouge import RougeCalculator
 parser = argparse.ArgumentParser(description='seq2seqAttn')
 # path info
 parser.add_argument('-save_path', type=str, default='checkpoints/')
-parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.review.txt')
+parser.add_argument('-embed_path', type=str, default='../../embedding/glove/glove.aligned.txt')
 parser.add_argument('-train_dir', type=str, default='../../data/aligned/train/')
 parser.add_argument('-valid_dir', type=str, default='../../data/aligned/valid/')
 parser.add_argument('-test_dir', type=str, default='../../data/aligned/test/')
@@ -40,6 +40,7 @@ parser.add_argument('-encoder_dropout', type=float, default=0.1)
 parser.add_argument('-decoder_dropout', type=float, default=0.1)
 parser.add_argument('-lr', type=float, default=1e-4)
 parser.add_argument('-lr_decay', type=float, default=0.5)
+parser.add_argument('-lr_decay_start', type=int, default=6)
 parser.add_argument('-max_norm', type=float, default=5.0)
 parser.add_argument('-batch_size', type=int, default=32)
 parser.add_argument('-epochs', type=int, default=10)
@@ -161,9 +162,9 @@ def train():
     args.embed_dim = len(embed[0])
 
     train_dataset = Dataset(train_data)
-    val_dataset = Dataset(val_data)
+    val_dataset = Dataset(test_data)
     train_iter = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_iter = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=True)
+    val_iter = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False)
 
     net = EncoderDecoder(args, embed)
     if args.use_cuda:
@@ -173,6 +174,8 @@ def train():
 
     print('Begin training...')
     for epoch in range(1, args.epochs + 1):
+        if epoch >= args.lr_decay_start:
+            adjust_learning_rate(optim, epoch - args.lr_decay_start + 1)
         for i, batch in enumerate(train_iter):
             src, trg, src_mask, src_lens, trg_lens, _1, _2 = vocab.make_tensors(batch)
             pre_output = net(src, trg, src_mask, src_lens, trg_lens)
@@ -239,7 +242,7 @@ def test():
     args.embed_num = len(embed)
     args.embed_dim = len(embed[0])
     test_dataset = Dataset(test_data)
-    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True)
+    test_iter = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False)
 
     print('Loading model...')
     checkpoint = torch.load(args.save_path + args.load_model)

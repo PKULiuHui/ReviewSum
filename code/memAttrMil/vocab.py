@@ -11,7 +11,7 @@ import torch.utils.data as data
 class Vocab:
     def __init__(self, args, embed=None):
         self.args = args
-        self.embed = []
+        self.embed = []  # pretrained embed是embed的一部分
         self.PAD_IDX = 0
         self.SOS_IDX = 1
         self.EOS_IDX = 2
@@ -80,7 +80,7 @@ class Vocab:
         else:
             self.product2cnt[product] += 1
 
-    # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量，
+    # 已经读完了所有句子，对词表进行剪枝，只保留出现次数大于等于self.args.word_min_cnt的词以及相应词向量
     # 同时对user列表和product列表进行剪枝，只保留常见user和常见product
     def trim(self):
         print('original vocab size: %d' % len(self.word2cnt))
@@ -152,7 +152,7 @@ class Vocab:
 
     # 给定一个batch的文本数据，删除上一个batch的可变词典部分，生成该batch的可变词典；
     # 同时，生成神经网络所需要的input tensors
-    def read_batch(self, batch):
+    def make_tensors(self, batch, train_data):
         # 删除上一个batch的可变词典部分，可变词典部分没有embedding，不记录word_cnt
         for i in range(self.fixed_num, self.word_num):
             w = self.id_word(i)
@@ -183,14 +183,14 @@ class Vocab:
         src_max_len = min(self.args.review_max_len, len(src_text[0].split()))
         trg_max_len = self.args.sum_max_len
         src, trg = [], []
-        src_embed, trg_embed = [], []  # 针对embed的src和trg输入，与src和trg相比，将处于可变词典的词序号替换成UNK_IDX
+        src_embed, trg_embed = [], []
         for review in src_text:
             review = review.split()[:src_max_len]
             cur_idx = [self.word_id(w) for w in review]
             cur_idx.extend([self.PAD_IDX] * (src_max_len - len(review)))
             src.append(cur_idx)
             src_embed.append([i if i < self.fixed_num else self.UNK_IDX for i in cur_idx])
-        for i, summary in enumerate(trg_text):
+        for summary in trg_text:
             summary = summary.split() + [self.EOS_TOKEN]
             summary = summary[:trg_max_len]
             cur_idx = [self.word_id(w) for w in summary]
@@ -213,16 +213,61 @@ class Vocab:
                 src_product.append(0)
             src_rating.append(int(rating))
 
+        u_review, u_sum, p_review, p_sum = [], [], [], []
+        review_max_len = self.args.review_max_len
+        sum_max_len = self.args.sum_max_len
+        for i in idx:
+            cur_user, cur_product = batch['userID'][i], batch['productID'][i]
+            mem_user, mem_product = batch['user_review'][i], batch['product_review'][i]
+            mem_user.sort(key=lambda p: p[-2], reverse=True)
+            mem_product.sort(key=lambda p: p[-2], reverse=True)
+            mem_user, mem_product = mem_user[:self.args.mem_size], mem_product[:self.args.mem_size]
+            for mem_piece in mem_user:
+                mem_data = train_data[mem_piece[0]]
+                assert mem_data['userID'] == cur_user
+                review = mem_data['reviewText'].split()[:review_max_len]
+                cur_idx = [self.word_id(w) for w in review]
+                cur_idx.extend([self.PAD_IDX] * (review_max_len - len(review)))
+                cur_idx = [i if i < self.fixed_num else self.UNK_IDX for i in cur_idx]
+                u_review.append(cur_idx)
+                summary = mem_data['summary'].split()[:sum_max_len]
+                cur_idx = [self.word_id(w) for w in summary]
+                cur_idx.extend([self.PAD_IDX] * (sum_max_len - len(summary)))
+                cur_idx = [i if i < self.fixed_num else self.UNK_IDX for i in cur_idx]
+                u_sum.append(cur_idx)
+            for _ in range(len(mem_user), self.args.mem_size):  # 不足补全
+                u_review.append([self.EOS_IDX] + [self.PAD_IDX] * (review_max_len - 1))
+                u_sum.append([self.EOS_IDX] + [self.PAD_IDX] * (sum_max_len - 1))
+            for mem_piece in mem_product:
+                mem_data = train_data[mem_piece[0]]
+                assert mem_data['productID'] == cur_product
+                review = mem_data['reviewText'].split()[:review_max_len]
+                cur_idx = [self.word_id(w) for w in review]
+                cur_idx.extend([self.PAD_IDX] * (review_max_len - len(review)))
+                cur_idx = [i if i < self.fixed_num else self.UNK_IDX for i in cur_idx]
+                p_review.append(cur_idx)
+                summary = mem_data['summary'].split()[:sum_max_len]
+                cur_idx = [self.word_id(w) for w in summary]
+                cur_idx.extend([self.PAD_IDX] * (sum_max_len - len(summary)))
+                cur_idx = [i if i < self.fixed_num else self.UNK_IDX for i in cur_idx]
+                p_sum.append(cur_idx)
+            for _ in range(len(mem_product), self.args.mem_size):  # 不足补全
+                p_review.append([self.EOS_IDX] + [self.PAD_IDX] * (review_max_len - 1))
+                p_sum.append([self.EOS_IDX] + [self.PAD_IDX] * (sum_max_len - 1))
+
         src, trg = torch.LongTensor(src), torch.LongTensor(trg)
         src_embed, trg_embed = torch.LongTensor(src_embed), torch.LongTensor(trg_embed)
-        src_user, src_product = torch.LongTensor(src_user), torch.LongTensor(src_product)
-        src_rating = torch.LongTensor(src_rating)
+        src_user, src_product, src_rating = torch.LongTensor(src_user), torch.LongTensor(src_product), torch.LongTensor(
+            src_rating)
+        u_review, u_sum, p_review, p_sum = torch.LongTensor(u_review), torch.LongTensor(u_sum), torch.LongTensor(
+            p_review), torch.LongTensor(p_sum)
         if self.args.use_cuda:
             src, trg = src.cuda(), trg.cuda()
             src_embed, trg_embed = src_embed.cuda(), trg_embed.cuda()
             src_user, src_product, src_rating = src_user.cuda(), src_product.cuda(), src_rating.cuda()
+            u_review, u_sum, p_review, p_sum = u_review.cuda(), u_sum.cuda(), p_review.cuda(), p_sum.cuda()
 
-        return src, trg, src_embed, trg_embed, src_user, src_product, src_rating, src_text, trg_text
+        return src, trg, src_embed, trg_embed, src_user, src_product, src_rating, u_review, u_sum, p_review, p_sum, src_text, trg_text
 
 
 class Dataset(data.Dataset):
