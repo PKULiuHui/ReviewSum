@@ -1,1 +1,0 @@
-seq2seqCopy attr2 seq2seqAttn attr1 hssc seq2seq attr 
